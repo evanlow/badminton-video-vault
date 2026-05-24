@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}My Videos – Badminton Video Vault{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+  <h2 class="mb-0"><i class="bi bi-collection-play me-2 text-primary"></i>My Videos</h2>
+  <a href="{{ url_for('upload') }}" class="btn btn-primary">
+    <i class="bi bi-cloud-upload me-1"></i>Upload
+  </a>
+</div>
+
+{# Filter bar #}
+<form method="GET" class="row g-2 mb-4 align-items-end">
+  <div class="col-sm-5">
+    <label class="form-label small fw-semibold">Filter by Tag</label>
+    <input type="text" name="tag" class="form-control form-control-sm" value="{{ tag_filter }}" placeholder="e.g. singles">
+  </div>
+  <div class="col-sm-4">
+    <label class="form-label small fw-semibold">Visibility</label>
+    <select name="visibility" class="form-select form-select-sm">
+      <option value="" {% if not visibility_filter %}selected{% endif %}>All</option>
+      <option value="private" {% if visibility_filter == 'private' %}selected{% endif %}>Private</option>
+      <option value="shared" {% if visibility_filter == 'shared' %}selected{% endif %}>Shared</option>
+      <option value="public" {% if visibility_filter == 'public' %}selected{% endif %}>Public</option>
+    </select>
+  </div>
+  <div class="col-sm-3 d-flex gap-2">
+    <button type="submit" class="btn btn-outline-primary btn-sm">Filter</button>
+    {% if tag_filter or visibility_filter %}
+    <a href="{{ url_for('videos') }}" class="btn btn-outline-secondary btn-sm">Clear</a>
+    {% endif %}
+  </div>
+</form>
+
+{% if pagination.items %}
+<div class="row row-cols-1 row-cols-sm-2 row-cols-lg-3 g-4">
+  {% for video in pagination.items %}
+  <div class="col">
+    <div class="card h-100 shadow-sm video-card">
+      <div class="card-body">
+        <div class="d-flex align-items-start justify-content-between mb-2">
+          <div class="text-truncate me-2">
+            <h6 class="card-title mb-1 text-truncate" title="{{ video.filename }}">
+              <i class="bi bi-film text-secondary me-1"></i>{{ video.filename }}
+            </h6>
+          </div>
+          {% if video.visibility == 'private' %}
+            <span class="badge bg-secondary flex-shrink-0">Private</span>
+          {% elif video.visibility == 'shared' %}
+            <span class="badge bg-warning text-dark flex-shrink-0">Shared</span>
+          {% else %}
+            <span class="badge bg-success flex-shrink-0">Public</span>
+          {% endif %}
+        </div>
+
+        <p class="card-text text-muted small mb-1">
+          <i class="bi bi-calendar3 me-1"></i>
+          {{ video.session_date.strftime('%b %d, %Y') if video.session_date else 'No date' }}
+        </p>
+        <p class="card-text text-muted small mb-2">
+          <i class="bi bi-hdd me-1"></i>{{ video.formatted_size() }}
+        </p>
+
+        {% if video.tag_list %}
+        <div class="mb-2">
+          {% for tag in video.tag_list %}
+            <span class="badge bg-light text-dark border me-1">{{ tag }}</span>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if video.notes %}
+        <p class="card-text text-muted small text-truncate" title="{{ video.notes }}">{{ video.notes }}</p>
+        {% endif %}
+      </div>
+      <div class="card-footer bg-transparent border-top-0">
+        <a href="{{ url_for('video_detail', video_id=video.id) }}" class="btn btn-sm btn-primary w-100">
+          <i class="bi bi-play-circle me-1"></i>View & Play
+        </a>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{# Pagination #}
+{% if pagination.pages > 1 %}
+<nav class="mt-4 d-flex justify-content-center">
+  <ul class="pagination">
+    {% if pagination.has_prev %}
+    <li class="page-item">
+      <a class="page-link" href="{{ url_for('videos', page=pagination.prev_num, tag=tag_filter, visibility=visibility_filter) }}">
+        <i class="bi bi-chevron-left"></i>
+      </a>
+    </li>
+    {% endif %}
+    {% for page_num in pagination.iter_pages(left_edge=1, right_edge=1, left_current=2, right_current=2) %}
+      {% if page_num %}
+        <li class="page-item {% if page_num == pagination.page %}active{% endif %}">
+          <a class="page-link" href="{{ url_for('videos', page=page_num, tag=tag_filter, visibility=visibility_filter) }}">{{ page_num }}</a>
+        </li>
+      {% else %}
+        <li class="page-item disabled"><span class="page-link">…</span></li>
+      {% endif %}
+    {% endfor %}
+    {% if pagination.has_next %}
+    <li class="page-item">
+      <a class="page-link" href="{{ url_for('videos', page=pagination.next_num, tag=tag_filter, visibility=visibility_filter) }}">
+        <i class="bi bi-chevron-right"></i>
+      </a>
+    </li>
+    {% endif %}
+  </ul>
+</nav>
+{% endif %}
+
+{% else %}
+<div class="text-center py-5 text-muted">
+  <i class="bi bi-camera-video display-4 d-block mb-3"></i>
+  <p class="mb-2">
+    {% if tag_filter or visibility_filter %}
+      No videos match your filters.
+    {% else %}
+      You haven't uploaded any videos yet.
+    {% endif %}
+  </p>
+  {% if not tag_filter and not visibility_filter %}
+  <a href="{{ url_for('upload') }}" class="btn btn-primary">Upload Your First Video</a>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}
