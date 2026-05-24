@@ -4,8 +4,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _get_secret_key():
+    key = os.environ.get("FLASK_SECRET_KEY")
+    if not key:
+        if os.environ.get("FLASK_ENV") == "development":
+            return "dev-secret-key"
+        raise RuntimeError(
+            "FLASK_SECRET_KEY environment variable must be set in non-development environments."
+        )
+    return key
+
+
 class Config:
-    SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key")
+    SECRET_KEY = _get_secret_key()
     SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", "sqlite:///badminton_vault.db")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 

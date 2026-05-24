@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from flask import (
     Flask,
     render_template,
@@ -21,6 +21,8 @@ from flask_login import (
     current_user,
 )
 from functools import wraps
+from sqlalchemy import func
+from werkzeug.utils import secure_filename
 
 from config import Config
 from extensions import db, login_manager
@@ -29,6 +31,16 @@ from forms import LoginForm, UploadVideoForm, EditVideoForm, CreateUserForm
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+ALLOWED_EXTENSIONS = {"mp4", "avi", "mov", "mkv", "webm"}
+ALLOWED_MIME_TYPES = {
+    "video/mp4",
+    "video/avi",
+    "video/x-msvideo",
+    "video/quicktime",
+    "video/x-matroska",
+    "video/webm",
+}
 
 
 def create_app(config_class=Config):
@@ -40,9 +52,6 @@ def create_app(config_class=Config):
     login_manager.login_view = "login"
     login_manager.login_message = "Please log in to access this page."
     login_manager.login_message_category = "warning"
-
-    with app.app_context():
-        db.create_all()
 
     return app
 
@@ -78,7 +87,7 @@ def generate_presigned_upload_url(s3_key, content_type, expiry=None):
             ExpiresIn=expiry,
         )
         return url
-    except ClientError as exc:
+    except (ClientError, BotoCoreError) as exc:
         logger.error("Error generating presigned upload URL: %s", exc)
         return None
 
@@ -94,13 +103,14 @@ def generate_presigned_play_url(s3_key, expiry=None):
             ExpiresIn=expiry,
         )
         return url
-    except ClientError as exc:
+    except (ClientError, BotoCoreError) as exc:
         logger.error("Error generating presigned play URL: %s", exc)
         return None
 
 
 def generate_presigned_download_url(s3_key, filename, expiry=None):
     """Return a presigned GET URL that triggers a file download."""
+    safe_filename = secure_filename(filename) or "download"
     s3 = get_s3_client()
     expiry = expiry or app.config["PRESIGNED_URL_EXPIRY"]
     try:
@@ -109,12 +119,12 @@ def generate_presigned_download_url(s3_key, filename, expiry=None):
             Params={
                 "Bucket": app.config["S3_BUCKET_NAME"],
                 "Key": s3_key,
-                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+                "ResponseContentDisposition": f'attachment; filename="{safe_filename}"',
             },
             ExpiresIn=expiry,
         )
         return url
-    except ClientError as exc:
+    except (ClientError, BotoCoreError) as exc:
         logger.error("Error generating presigned download URL: %s", exc)
         return None
 
@@ -124,7 +134,7 @@ def delete_s3_object(s3_key):
     try:
         s3.delete_object(Bucket=app.config["S3_BUCKET_NAME"], Key=s3_key)
         return True
-    except ClientError as exc:
+    except (ClientError, BotoCoreError) as exc:
         logger.error("Error deleting S3 object %s: %s", s3_key, exc)
         return False
 
@@ -203,29 +213,33 @@ def dashboard():
 @login_required
 def upload():
     form = UploadVideoForm()
-    presigned_url = None
-    s3_key = None
 
     if form.validate_on_submit():
         file = form.video_file.data
         original_filename = file.filename
-        extension = os.path.splitext(original_filename)[1].lower()
-        unique_name = f"{secrets.token_hex(16)}{extension}"
-        s3_key = f"videos/{current_user.id}/{unique_name}"
+        if not original_filename:
+            flash("No file selected.", "danger")
+            return render_template("upload.html", form=form)
+
+        extension = os.path.splitext(original_filename)[1].lower().lstrip(".")
+        if extension not in ALLOWED_EXTENSIONS:
+            flash("Invalid file type. Please upload a video file (mp4, avi, mov, mkv, webm).", "danger")
+            return render_template("upload.html", form=form)
 
         content_type = file.content_type or "video/mp4"
-        presigned_url = generate_presigned_upload_url(s3_key, content_type)
-
-        if not presigned_url:
-            flash("Could not generate upload URL. Check your AWS configuration.", "danger")
+        if content_type not in ALLOWED_MIME_TYPES:
+            flash("Invalid file type. Please upload a video file.", "danger")
             return render_template("upload.html", form=form)
+
+        unique_name = f"{secrets.token_hex(16)}.{extension}"
+        s3_key = f"videos/{current_user.id}/{unique_name}"
 
         # Read file size before streaming
         file.stream.seek(0, 2)
         file_size = file.stream.tell()
         file.stream.seek(0)
 
-        # Upload directly via boto3 (server-side) for simplicity in MVP
+        # Upload directly via boto3 (server-side)
         s3 = get_s3_client()
         try:
             s3.upload_fileobj(
@@ -234,7 +248,7 @@ def upload():
                 s3_key,
                 ExtraArgs={"ContentType": content_type},
             )
-        except ClientError as exc:
+        except (ClientError, BotoCoreError) as exc:
             logger.error("S3 upload failed: %s", exc)
             flash("Upload to S3 failed. Please try again.", "danger")
             return render_template("upload.html", form=form)
@@ -303,9 +317,15 @@ def video_detail(video_id):
         video.visibility = form.visibility.data
         video.allow_download = form.allow_download.data
 
-        if video.visibility == "shared" and not video.share_token:
+        if video.visibility == "shared" and (
+            not video.share_token
+            or (video.share_expires_at and video.share_expires_at < datetime.utcnow())
+        ):
             video.share_token = secrets.token_urlsafe(32)
             video.share_expires_at = datetime.utcnow() + timedelta(days=30)
+        elif video.visibility != "shared":
+            video.share_token = None
+            video.share_expires_at = None
 
         db.session.commit()
         flash("Video details updated.", "success")
@@ -334,7 +354,11 @@ def delete_video(video_id):
     if video.uploaded_by_user_id != current_user.id and not current_user.is_admin:
         abort(403)
 
-    delete_s3_object(video.s3_key)
+    s3_deleted = delete_s3_object(video.s3_key)
+    if not s3_deleted:
+        flash("Could not delete the video file from storage. The video record has been kept.", "danger")
+        return redirect(url_for("video_detail", video_id=video_id))
+
     db.session.delete(video)
     db.session.commit()
     flash("Video deleted.", "success")
@@ -374,7 +398,12 @@ def shared_video(token):
 @admin_required
 def admin_users():
     users = User.query.order_by(User.created_at.desc()).all()
-    return render_template("admin_users.html", users=users)
+    video_counts = dict(
+        db.session.query(Video.uploaded_by_user_id, func.count(Video.id))
+        .group_by(Video.uploaded_by_user_id)
+        .all()
+    )
+    return render_template("admin_users.html", users=users, video_counts=video_counts)
 
 
 @app.route("/admin/users/create", methods=["GET", "POST"])
@@ -446,6 +475,15 @@ def server_error(e):
 # ---------------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------------
+
+@app.cli.command("init-db")
+def init_db():
+    """Create database tables (run once before first use)."""
+    import click
+    with app.app_context():
+        db.create_all()
+    click.echo("Database tables created.")
+
 
 @app.cli.command("create-admin")
 def create_admin():

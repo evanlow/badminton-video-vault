@@ -1,4 +1,5 @@
 from flask_wtf import FlaskForm
+from flask_wtf.file import FileField, FileRequired, FileAllowed
 from wtforms import (
     StringField,
     PasswordField,
@@ -6,7 +7,6 @@ from wtforms import (
     SelectField,
     DateField,
     BooleanField,
-    FileField,
     SubmitField,
 )
 from wtforms.validators import DataRequired, Email, Length, Optional, EqualTo
@@ -19,7 +19,13 @@ class LoginForm(FlaskForm):
 
 
 class UploadVideoForm(FlaskForm):
-    video_file = FileField("Video File", validators=[DataRequired()])
+    video_file = FileField(
+        "Video File",
+        validators=[
+            FileRequired(),
+            FileAllowed(["mp4", "avi", "mov", "mkv", "webm"], "Video files only."),
+        ],
+    )
     session_date = DateField("Session Date", validators=[Optional()])
     notes = TextAreaField("Notes", validators=[Optional(), Length(max=2000)])
     tags = StringField("Tags (comma-separated)", validators=[Optional(), Length(max=500)])

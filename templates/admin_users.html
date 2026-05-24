@@ -44,7 +44,7 @@
               {% endif %}
             </td>
             <td class="text-muted small">{{ user.created_at.strftime('%b %d, %Y') }}</td>
-            <td class="text-muted">{{ user.videos.count() }}</td>
+            <td class="text-muted">{{ video_counts.get(user.id, 0) }}</td>
             <td>
               {% if user.id != current_user.id %}
               <form method="POST" action="{{ url_for('admin_toggle_user', user_id=user.id) }}"
