@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 import boto3
 from botocore.exceptions import ClientError
+from urllib.parse import urlsplit
 from flask import (
     Flask,
     render_template,
@@ -161,6 +162,11 @@ def login():
         if user and user.is_active and user.check_password(form.password.data):
             login_user(user)
             next_page = request.args.get("next")
+            # Validate next_page to prevent open-redirect attacks
+            if next_page:
+                parsed = urlsplit(next_page)
+                if parsed.scheme or parsed.netloc:
+                    next_page = None
             return redirect(next_page or url_for("dashboard"))
         flash("Invalid email or password.", "danger")
     return render_template("login.html", form=form)
@@ -471,4 +477,5 @@ def inject_now():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    debug = os.environ.get("FLASK_ENV") == "development"
+    app.run(debug=debug)
