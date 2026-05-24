@@ -130,6 +130,20 @@ def delete_s3_object(s3_key):
         return False
 
 
+def _safe_next_url(next_url):
+    """Return next_url only if it is a safe relative URL on this host."""
+    if not next_url:
+        return None
+    parsed = urlsplit(next_url)
+    # Reject anything with a scheme or netloc (absolute or protocol-relative URLs)
+    if parsed.scheme or parsed.netloc:
+        return None
+    # Must begin with a forward-slash to guarantee it is a path on this server
+    if not next_url.startswith("/"):
+        return None
+    return next_url
+
+
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -161,12 +175,7 @@ def login():
         user = User.query.filter_by(email=form.email.data.lower().strip()).first()
         if user and user.is_active and user.check_password(form.password.data):
             login_user(user)
-            next_page = request.args.get("next")
-            # Validate next_page to prevent open-redirect attacks
-            if next_page:
-                parsed = urlsplit(next_page)
-                if parsed.scheme or parsed.netloc:
-                    next_page = None
+            next_page = _safe_next_url(request.args.get("next"))
             return redirect(next_page or url_for("dashboard"))
         flash("Invalid email or password.", "danger")
     return render_template("login.html", form=form)
