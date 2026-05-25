@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}{{ video.filename }} – Badminton Video Vault{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+  {# Left: video player #}
+  <div class="col-lg-8">
+    {% if not shared_view %}
+    <nav aria-label="breadcrumb" class="mb-3">
+      <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="{{ url_for('videos') }}">My Videos</a></li>
+        <li class="breadcrumb-item active text-truncate" style="max-width:300px;">{{ video.filename }}</li>
+      </ol>
+    </nav>
+    {% endif %}
+
+    <div class="card shadow-sm mb-3">
+      <div class="card-body p-0 bg-black rounded">
+        {% if play_url %}
+        <video class="w-100 rounded" controls controlsList="{{ 'nodownload' if not video.allow_download else '' }}" style="max-height:480px;">
+          <source src="{{ play_url }}">
+          Your browser does not support HTML5 video.
+        </video>
+        {% else %}
+        <div class="text-center text-white py-5">
+          <i class="bi bi-exclamation-triangle-fill fs-1 text-warning"></i>
+          <p class="mt-2">Could not generate playback URL. Check AWS configuration.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="d-flex gap-2 flex-wrap mb-3">
+      {% if download_url %}
+      <a href="{{ download_url }}" class="btn btn-outline-success" download>
+        <i class="bi bi-download me-1"></i>Download
+      </a>
+      {% endif %}
+      {% if not shared_view %}
+      {% if video.visibility == 'shared' and video.share_token %}
+      <button class="btn btn-outline-secondary" onclick="copyShareLink()" id="copyShareBtn">
+        <i class="bi bi-share me-1"></i>Copy Share Link
+      </button>
+      <input type="hidden" id="shareLink" value="{{ url_for('shared_video', token=video.share_token, _external=True) }}">
+      {% endif %}
+      {% endif %}
+    </div>
+
+    {# Metadata card #}
+    <div class="card shadow-sm">
+      <div class="card-header fw-semibold bg-light">Video Details</div>
+      <div class="card-body">
+        <dl class="row mb-0">
+          <dt class="col-sm-4 text-muted">Filename</dt>
+          <dd class="col-sm-8">{{ video.filename }}</dd>
+
+          <dt class="col-sm-4 text-muted">Session Date</dt>
+          <dd class="col-sm-8">{{ video.session_date.strftime('%B %d, %Y') if video.session_date else '—' }}</dd>
+
+          <dt class="col-sm-4 text-muted">File Size</dt>
+          <dd class="col-sm-8">{{ video.formatted_size() }}</dd>
+
+          <dt class="col-sm-4 text-muted">Visibility</dt>
+          <dd class="col-sm-8">
+            {% if video.visibility == 'private' %}
+              <span class="badge bg-secondary">Private</span>
+            {% elif video.visibility == 'shared' %}
+              <span class="badge bg-warning text-dark">Shared</span>
+            {% else %}
+              <span class="badge bg-success">Public</span>
+            {% endif %}
+          </dd>
+
+          {% if video.tag_list %}
+          <dt class="col-sm-4 text-muted">Tags</dt>
+          <dd class="col-sm-8">
+            {% for tag in video.tag_list %}
+              <span class="badge bg-light text-dark border me-1">{{ tag }}</span>
+            {% endfor %}
+          </dd>
+          {% endif %}
+
+          {% if video.notes %}
+          <dt class="col-sm-4 text-muted">Notes</dt>
+          <dd class="col-sm-8">{{ video.notes }}</dd>
+          {% endif %}
+
+          <dt class="col-sm-4 text-muted">Uploaded</dt>
+          <dd class="col-sm-8 text-muted small">{{ video.created_at.strftime('%B %d, %Y at %H:%M UTC') }}</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  {# Right: edit form (owner/admin only) #}
+  {% if not shared_view and form %}
+  <div class="col-lg-4">
+    <div class="card shadow-sm">
+      <div class="card-header fw-semibold bg-light">Edit Details</div>
+      <div class="card-body">
+        <form method="POST" novalidate>
+          {{ form.hidden_tag() }}
+          <div class="mb-3">
+            {{ form.session_date.label(class="form-label small fw-semibold") }}
+            {{ form.session_date(class="form-control form-control-sm") }}
+          </div>
+          <div class="mb-3">
+            {{ form.notes.label(class="form-label small fw-semibold") }}
+            {{ form.notes(class="form-control form-control-sm", rows=4) }}
+          </div>
+          <div class="mb-3">
+            {{ form.tags.label(class="form-label small fw-semibold") }}
+            {{ form.tags(class="form-control form-control-sm", placeholder="singles, training, ...") }}
+          </div>
+          <div class="mb-3">
+            {{ form.visibility.label(class="form-label small fw-semibold") }}
+            {{ form.visibility(class="form-select form-select-sm") }}
+          </div>
+          <div class="mb-3 form-check">
+            {{ form.allow_download(class="form-check-input") }}
+            {{ form.allow_download.label(class="form-check-label small") }}
+          </div>
+          {{ form.submit(class="btn btn-primary btn-sm w-100") }}
+        </form>
+      </div>
+    </div>
+
+    {# Danger zone #}
+    <div class="card shadow-sm mt-3 border-danger">
+      <div class="card-header fw-semibold bg-danger text-white">Danger Zone</div>
+      <div class="card-body">
+        <p class="small text-muted mb-3">Permanently delete this video from S3 and the database.</p>
+        <form method="POST" action="{{ url_for('delete_video', video_id=video.id) }}" onsubmit="return confirm('Are you sure you want to permanently delete this video? This cannot be undone.');">
+          {{ form.hidden_tag() }}
+          <button type="submit" class="btn btn-danger btn-sm w-100">
+            <i class="bi bi-trash me-1"></i>Delete Video
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function copyShareLink() {
+  const link = document.getElementById('shareLink').value;
+  navigator.clipboard.writeText(link).then(() => {
+    const btn = document.getElementById('copyShareBtn');
+    btn.textContent = '✓ Copied!';
+    btn.classList.replace('btn-outline-secondary', 'btn-success');
+    setTimeout(() => {
+      btn.innerHTML = '<i class="bi bi-share me-1"></i>Copy Share Link';
+      btn.classList.replace('btn-success', 'btn-outline-secondary');
+    }, 2000);
+  });
+}
+</script>
+{% endblock %}
