@@ -1,0 +1,60 @@
+name: Test and Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # ── Job 1: Run smoke tests ─────────────────────────────────────────────────
+  test:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run regression suite
+        run: python tests/run_all_smoke.py
+
+  # ── Job 2: Deploy to EC2 (only runs if test job passed) ────────────────────
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: test          # blocked until all smoke tests pass
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            cd /srv/badminton-video-vault
+
+            # Pull latest code
+            git pull origin main
+
+            # Activate venv and update dependencies
+            source venv/bin/activate
+            pip install -r requirements.txt
+
+            # Restart the application service
+            sudo systemctl restart badminton-vault
+
+            # Confirm the service came back up
+            sleep 3
+            sudo systemctl is-active --quiet badminton-vault && echo "Service is running." || (echo "Service failed to start!" && exit 1)

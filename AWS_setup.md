@@ -14,10 +14,11 @@ This guide provides comprehensive, step-by-step instructions for configuring the
 6. [Generate Access Keys](#generate-access-keys)
 7. [Configure CORS (Optional)](#configure-cors-optional)
 8. [Configure Your Application](#configure-your-application)
-9. [Verify the Setup](#verify-the-setup)
-10. [Security Best Practices](#security-best-practices)
-11. [Cost Considerations](#cost-considerations)
-12. [Troubleshooting](#troubleshooting)
+9. [Database Options for Production](#database-options-for-production)
+10. [Verify the Setup](#verify-the-setup)
+11. [Security Best Practices](#security-best-practices)
+12. [Cost Considerations](#cost-considerations)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -237,6 +238,78 @@ With the AWS resources set up, configure the application environment variables:
 - **Longer expiry** (e.g., 7200 seconds / 2 hours) is more convenient for long viewing sessions.
 - The default of 3600 seconds (1 hour) provides a good balance.
 - Share links have their own 30-day expiry managed at the application level, but the presigned URLs within them still respect this setting.
+
+---
+
+## Database Options for Production
+
+Locally the application uses SQLite (a single file: `badminton_vault.db`). The database is configured entirely through the `DATABASE_URL` environment variable, so the same application code works with any SQL database SQLAlchemy supports.
+
+### Option A — SQLite on an EBS-backed EC2 Instance (simplest)
+
+If you deploy to a **single EC2 instance**, SQLite works perfectly in production as long as the database file lives on an **EBS (Elastic Block Store)** volume, which persists across instance reboots and is independent of the root volume.
+
+- **When to use:** Personal or small-team vault; single server; no auto-scaling needed.
+- **Cost:** No extra database cost beyond the EC2 instance itself.
+- **How to configure:** Mount the EBS volume and point `DATABASE_URL` at the file path:
+
+  ```ini
+  DATABASE_URL=sqlite:////data/badminton_vault.db
+  ```
+
+  (Four slashes = absolute path on Unix.)
+
+- **Limitation:** Only one running instance can safely write to a SQLite file at a time. Not suitable if you later add auto-scaling or load balancing.
+
+### Option B — Amazon RDS (recommended for multi-instance or managed deployments)
+
+If you deploy to **Elastic Beanstalk, ECS, Fargate**, or any setup where the filesystem is ephemeral, you **must** use an external database. Amazon RDS is the natural AWS-managed choice.
+
+- **When to use:** Container-based deployments; Elastic Beanstalk; any auto-scaling topology.
+- **Recommended engine:** PostgreSQL (free tier: `db.t3.micro` for 12 months).
+- **Cost:** ~$15–25/month after free tier for a `db.t3.micro` instance.
+
+#### Steps to create an RDS PostgreSQL instance
+
+1. In the AWS console, navigate to **RDS → Create database**.
+2. Choose **Standard create** → **PostgreSQL**.
+3. Under **Templates**, select **Free tier** (if eligible).
+4. Set a **DB instance identifier**, **Master username**, and a strong **Master password**.
+5. Leave **DB instance class** as `db.t3.micro`.
+6. Under **Connectivity**, place the instance in the same VPC as your application server.
+7. Set **Public access** to **No** (the Flask app connects from inside the VPC; never expose RDS to the internet).
+8. Note the **Endpoint** hostname shown after the instance is created.
+
+#### Configure the application to use RDS
+
+1. Add `psycopg2-binary` to `requirements.txt` (PostgreSQL driver for Python).
+2. Set `DATABASE_URL` in your production environment:
+
+   ```ini
+   DATABASE_URL=postgresql://username:password@your-rds-endpoint.rds.amazonaws.com:5432/badminton_vault
+   ```
+
+3. Run the database initialisation command on first deploy:
+
+   ```bash
+   flask init-db
+   ```
+
+4. Create the admin account:
+
+   ```bash
+   flask create-admin
+   ```
+
+> **Security note:** Never put the RDS password in source control. Use environment variables or AWS Secrets Manager.
+
+### Summary
+
+| Scenario | Database choice |
+|----------|-----------------|
+| Single EC2 instance | SQLite on an EBS volume — no RDS needed |
+| Elastic Beanstalk / ECS / Fargate | RDS PostgreSQL or MySQL required |
+| Local development | SQLite (default) — no change needed |
 
 ---
 
