@@ -48,7 +48,7 @@ If you do not already have an AWS account:
 
 ## Create an S3 Bucket
 
-Amazon S3 (Simple Storage Service) is used to store all uploaded video files. The application never exposes S3 objects publicly — it uses presigned URLs for all access.
+Amazon S3 (Simple Storage Service) is used to store all uploaded video files. Uploads are performed server-side by the Flask app, and the application never exposes S3 objects publicly — it uses presigned URLs for playback and download access.
 
 ### Steps
 
@@ -174,7 +174,7 @@ The application authenticates to AWS using access keys (an Access Key ID and Sec
 
 ## Configure CORS (Optional)
 
-CORS (Cross-Origin Resource Sharing) configuration is needed if your application serves content from a different domain than where S3 presigned URLs point. For most deployments (especially development), this is not required since the application streams videos server-side. However, if you encounter CORS errors during video playback in production:
+CORS (Cross-Origin Resource Sharing) configuration is needed if your application serves content from a different domain than where S3 presigned URLs point. The browser fetches video playback URLs directly from S3 using presigned URLs, so CORS may be required depending on your frontend domain/origin setup. If you encounter CORS errors during video playback:
 
 1. Open your bucket in the S3 console.
 2. Go to the **Permissions** tab.
@@ -264,7 +264,11 @@ s3 = boto3.client(
 )
 
 bucket = os.getenv('S3_BUCKET_NAME')
-response = s3.head_bucket(Bucket=bucket)
+test_key = 'connectivity-test.txt'
+
+s3.put_object(Bucket=bucket, Key=test_key, Body=b'connectivity test')
+s3.delete_object(Bucket=bucket, Key=test_key)
+
 print(f'✅ Successfully connected to bucket: {bucket}')
 print(f'   Region: {os.getenv(\"AWS_REGION\")}')
 "
