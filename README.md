@@ -29,7 +29,8 @@ A Flask web app for uploading, storing, sharing, and playing badminton session v
 
 ```bash
 python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+source venv/bin/activate        # macOS/Linux
+.\venv\Scripts\Activate.ps1    # Windows (PowerShell)
 pip install -r requirements.txt
 ```
 
@@ -40,13 +41,19 @@ cp .env.example .env
 # Edit .env with your AWS credentials and Flask secret key
 ```
 
-### 3. Create an admin user
+### 3. Initialise the database
+
+```bash
+flask init-db
+```
+
+### 4. Create an admin user
 
 ```bash
 flask create-admin
 ```
 
-### 4. Run the development server
+### 5. Run the development server
 
 ```bash
 flask run
