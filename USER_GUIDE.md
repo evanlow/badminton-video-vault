@@ -179,14 +179,14 @@ Badminton Video Vault offers three visibility levels for each video:
 ### Public
 
 - The video is visible to **all logged-in users** in the Videos library.
-- Anyone with the share link (if previously generated) can also access it without logging in.
+- Accessing a public video still requires logging in. To share a video with someone who doesn't have an account, use **Shared (link)** visibility instead.
 
 ### How to Share a Video
 
 1. Go to the video's detail page.
-2. Set **Visibility** to **Shared (link)** or **Public**.
+2. Set **Visibility** to **Shared (link)**.
 3. Click **Save Changes**.
-4. For shared videos, copy the **share link** displayed on the page and send it to anyone you want to view the video.
+4. Copy the **share link** displayed on the page and send it to anyone you want to view the video — no login required.
 
 ---
 
