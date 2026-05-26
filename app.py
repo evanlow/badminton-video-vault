@@ -21,11 +21,11 @@ from flask_login import (
     current_user,
 )
 from functools import wraps
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from werkzeug.utils import secure_filename
 
 from config import Config
-from extensions import db, login_manager
+from extensions import db, login_manager, csrf
 from models import User, Video
 from forms import LoginForm, UploadVideoForm, EditVideoForm, CreateUserForm
 
@@ -49,6 +49,7 @@ def create_app(config_class=Config):
 
     db.init_app(app)
     login_manager.init_app(app)
+    csrf.init_app(app)
     login_manager.login_view = "login"
     login_manager.login_message = "Please log in to access this page."
     login_manager.login_message_category = "warning"
@@ -283,12 +284,17 @@ def videos():
     tag_filter = request.args.get("tag", "").strip()
     visibility_filter = request.args.get("visibility", "").strip()
 
-    query = Video.query.filter_by(uploaded_by_user_id=current_user.id)
+    query = Video.query.filter(
+        or_(
+            Video.uploaded_by_user_id == current_user.id,
+            Video.visibility == "public",
+        )
+    )
 
     if tag_filter:
         query = query.filter(Video.tags.ilike(f"%{tag_filter}%"))
     if visibility_filter:
-        query = query.filter_by(visibility=visibility_filter)
+        query = query.filter(Video.visibility == visibility_filter)
 
     pagination = query.order_by(Video.created_at.desc()).paginate(page=page, per_page=12, error_out=False)
     return render_template(
@@ -305,12 +311,14 @@ def video_detail(video_id):
     video = db.session.get(Video, video_id)
     if video is None:
         abort(404)
-    # Only the uploader or an admin can view
-    if video.uploaded_by_user_id != current_user.id and not current_user.is_admin:
+
+    can_edit = video.uploaded_by_user_id == current_user.id or current_user.is_admin
+    # Allow access if owner, admin, or video is public
+    if not can_edit and video.visibility != "public":
         abort(403)
 
-    form = EditVideoForm(obj=video)
-    if form.validate_on_submit():
+    form = EditVideoForm(obj=video) if can_edit else None
+    if form and form.validate_on_submit():
         video.session_date = form.session_date.data
         video.notes = form.notes.data
         video.tags = form.tags.data
