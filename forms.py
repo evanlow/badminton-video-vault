@@ -18,6 +18,28 @@ class LoginForm(FlaskForm):
     submit = SubmitField("Log In")
 
 
+class ForgotPasswordForm(FlaskForm):
+    email = StringField("Email", validators=[DataRequired(), Email()])
+    submit = SubmitField("Send reset link")
+
+
+class ResetPasswordForm(FlaskForm):
+    password = PasswordField(
+        "New password",
+        validators=[DataRequired(), Length(min=8, message="Password must be at least 8 characters.")],
+    )
+    confirm_password = PasswordField(
+        "Confirm new password",
+        validators=[DataRequired(), EqualTo("password", message="Passwords must match.")],
+    )
+    submit = SubmitField("Reset password")
+
+
+class MagicLoginForm(FlaskForm):
+    email = StringField("Email", validators=[DataRequired(), Email()])
+    submit = SubmitField("Send magic login link")
+
+
 class UploadVideoForm(FlaskForm):
     video_file = FileField(
         "Video File",

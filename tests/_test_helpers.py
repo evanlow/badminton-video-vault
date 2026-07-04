@@ -23,6 +23,11 @@ os.environ.setdefault("AWS_ACCESS_KEY_ID", "test-key")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test-secret")
 os.environ.setdefault("S3_BUCKET_NAME", "test-bucket")
 os.environ.setdefault("AWS_REGION", "us-east-1")
+os.environ.setdefault("APP_BASE_URL", "http://localhost")
+os.environ.setdefault("MAIL_SUPPRESS_SEND", "true")
+os.environ.setdefault("MAILGUN_API_KEY", "test-mailgun-key")
+os.environ.setdefault("MAILGUN_DOMAIN", "mg.example.com")
+os.environ.setdefault("MAIL_FROM", "Badminton Video Vault <noreply@example.com>")
 
 sys.path.insert(0, _ROOT_DIR)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -37,6 +42,7 @@ app.config.update(
         "TESTING": True,
         "WTF_CSRF_ENABLED": False,
         "SECRET_KEY": "test-secret-key",
+        "APP_BASE_URL": "http://localhost",
     }
 )
 

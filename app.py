@@ -2,6 +2,7 @@ import os
 import secrets
 import logging
 from datetime import datetime, timedelta
+from functools import wraps
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -20,14 +21,22 @@ from flask_login import (
     login_required,
     current_user,
 )
-from functools import wraps
 from sqlalchemy import func, or_
 from werkzeug.utils import secure_filename
 
 from config import Config
+from email_service import EmailDeliveryError, send_mailgun_email
 from extensions import db, login_manager, csrf
-from models import User, Video
-from forms import LoginForm, UploadVideoForm, EditVideoForm, CreateUserForm
+from models import AuthToken, User, Video
+from forms import (
+    CreateUserForm,
+    EditVideoForm,
+    ForgotPasswordForm,
+    LoginForm,
+    MagicLoginForm,
+    ResetPasswordForm,
+    UploadVideoForm,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -140,9 +149,6 @@ def delete_s3_object(s3_key):
         return False
 
 
-
-
-
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -150,6 +156,152 @@ def admin_required(f):
             abort(403)
         return f(*args, **kwargs)
     return decorated
+
+
+def _normalise_email(email):
+    return (email or "").lower().strip()
+
+
+def _request_ip():
+    return request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+
+
+def _user_agent():
+    return (request.headers.get("User-Agent") or "")[:255]
+
+
+def _app_link(endpoint, **values):
+    """Build absolute app links from APP_BASE_URL so production links are not localhost."""
+    base_url = app.config["APP_BASE_URL"].rstrip("/")
+    return f"{base_url}{url_for(endpoint, **values)}"
+
+
+def _generic_email_confirmation(link_type):
+    if link_type == "reset":
+        return "If an active account exists for that email, a password reset link has been sent."
+    return "If an active account exists for that email, a magic login link has been sent."
+
+
+def _auth_email_log_label(purpose):
+    if purpose == AuthToken.PURPOSE_RESET_PASSWORD:
+        return "reset"
+    if purpose == AuthToken.PURPOSE_MAGIC_LOGIN:
+        return "magic-login"
+    return "unknown"
+
+
+def _is_auth_email_throttled(user_id, purpose):
+    cooldown_seconds = int(app.config["AUTH_EMAIL_COOLDOWN_SECONDS"])
+    if cooldown_seconds <= 0:
+        return False
+
+    cutoff = datetime.utcnow() - timedelta(seconds=cooldown_seconds)
+    return db.session.query(AuthToken.id).filter(
+        AuthToken.user_id == user_id,
+        AuthToken.purpose == purpose,
+        AuthToken.used_at.is_(None),
+        AuthToken.created_at >= cutoff,
+    ).first() is not None
+
+
+def _send_password_reset_email(user, raw_token):
+    reset_url = _app_link("reset_password", token=raw_token)
+    ttl = int(app.config["PASSWORD_RESET_TOKEN_TTL_MINUTES"])
+
+    subject = "Reset your Badminton Video Vault password"
+    text_body = (
+        f"Hello {user.name},\n\n"
+        "We received a request to reset your Badminton Video Vault password.\n\n"
+        f"Reset your password here: {reset_url}\n\n"
+        f"This link expires in {ttl} minutes and can only be used once.\n\n"
+        "If you did not request this, you can ignore this email."
+    )
+    html_body = render_template(
+        "emails/password_reset.html",
+        user=user,
+        reset_url=reset_url,
+        ttl_minutes=ttl,
+    )
+    return send_mailgun_email(
+        user.email,
+        subject,
+        text_body,
+        html_body=html_body,
+        tag="password-reset",
+    )
+
+
+def _send_magic_login_email(user, raw_token):
+    magic_url = _app_link("consume_magic_login", token=raw_token)
+    ttl = int(app.config["MAGIC_LOGIN_TOKEN_TTL_MINUTES"])
+
+    subject = "Your Badminton Video Vault magic login link"
+    text_body = (
+        f"Hello {user.name},\n\n"
+        "Use this one-time link to log in to Badminton Video Vault:\n\n"
+        f"{magic_url}\n\n"
+        f"This link expires in {ttl} minutes and can only be used once.\n\n"
+        "If you did not request this, you can ignore this email."
+    )
+    html_body = render_template(
+        "emails/magic_login.html",
+        user=user,
+        magic_url=magic_url,
+        ttl_minutes=ttl,
+    )
+    return send_mailgun_email(
+        user.email,
+        subject,
+        text_body,
+        html_body=html_body,
+        tag="magic-login",
+    )
+
+
+def _issue_auth_token_email(user, purpose):
+    if purpose == AuthToken.PURPOSE_RESET_PASSWORD:
+        ttl = int(app.config["PASSWORD_RESET_TOKEN_TTL_MINUTES"])
+    elif purpose == AuthToken.PURPOSE_MAGIC_LOGIN:
+        ttl = int(app.config["MAGIC_LOGIN_TOKEN_TTL_MINUTES"])
+    else:
+        raise ValueError(f"Unknown auth token purpose: {purpose}")
+
+    if _is_auth_email_throttled(user.id, purpose):
+        logger.info(
+            "Skipping auth email for user_id=%s type=%s during cooldown",
+            user.id,
+            _auth_email_log_label(purpose),
+        )
+        return
+
+    raw_token, _ = AuthToken.create_for_user(
+        user=user,
+        purpose=purpose,
+        ttl_minutes=ttl,
+        created_ip=_request_ip(),
+        user_agent=_user_agent(),
+    )
+    db.session.commit()
+
+    try:
+        if purpose == AuthToken.PURPOSE_RESET_PASSWORD:
+            _send_password_reset_email(user, raw_token)
+        else:
+            _send_magic_login_email(user, raw_token)
+    except EmailDeliveryError as exc:
+        logger.error(
+            "Auth email delivery failed for user_id=%s type=%s: %s",
+            user.id,
+            _auth_email_log_label(purpose),
+            exc,
+        )
+
+
+def _find_active_user_by_email(email):
+    user = User.query.filter_by(email=_normalise_email(email)).first()
+    if not user or not user.is_active:
+        return None
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +323,7 @@ def login():
         return redirect(url_for("dashboard"))
     form = LoginForm()
     if form.validate_on_submit():
-        user = User.query.filter_by(email=form.email.data.lower().strip()).first()
+        user = User.query.filter_by(email=_normalise_email(form.email.data)).first()
         if user and user.is_active and user.check_password(form.password.data):
             login_user(user)
             return redirect(url_for("dashboard"))
@@ -185,6 +337,92 @@ def logout():
     logout_user()
     flash("You have been logged out.", "info")
     return redirect(url_for("login"))
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+
+    form = ForgotPasswordForm()
+    if form.validate_on_submit():
+        user = _find_active_user_by_email(form.email.data)
+        if user:
+            _issue_auth_token_email(user, AuthToken.PURPOSE_RESET_PASSWORD)
+
+        flash(_generic_email_confirmation("reset"), "info")
+        return redirect(url_for("login"))
+
+    return render_template("forgot_password.html", form=form)
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+
+    auth_token = AuthToken.find_usable(token, AuthToken.PURPOSE_RESET_PASSWORD)
+    if not auth_token:
+        flash("This password reset link is invalid, expired, or has already been used.", "danger")
+        return redirect(url_for("forgot_password"))
+
+    form = ResetPasswordForm()
+    if form.validate_on_submit():
+        user = auth_token.user
+        user.set_password(form.password.data)
+        auth_token.mark_used()
+        AuthToken.invalidate_unused(
+            user_id=user.id,
+            purpose=AuthToken.PURPOSE_RESET_PASSWORD,
+            exclude_id=auth_token.id,
+        )
+        db.session.commit()
+
+        flash("Your password has been reset. Please log in with your new password.", "success")
+        return redirect(url_for("login"))
+
+    return render_template("reset_password.html", form=form)
+
+
+@app.route("/magic-login", methods=["GET", "POST"])
+def magic_login():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+
+    form = MagicLoginForm()
+    if form.validate_on_submit():
+        user = _find_active_user_by_email(form.email.data)
+        if user:
+            _issue_auth_token_email(user, AuthToken.PURPOSE_MAGIC_LOGIN)
+
+        flash(_generic_email_confirmation("magic"), "info")
+        return redirect(url_for("login"))
+
+    return render_template("magic_login.html", form=form)
+
+
+@app.route("/magic-login/<token>")
+def consume_magic_login(token):
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+
+    auth_token = AuthToken.find_usable(token, AuthToken.PURPOSE_MAGIC_LOGIN)
+    if not auth_token:
+        flash("This magic login link is invalid, expired, or has already been used.", "danger")
+        return redirect(url_for("magic_login"))
+
+    user = auth_token.user
+    auth_token.mark_used()
+    AuthToken.invalidate_unused(
+        user_id=user.id,
+        purpose=AuthToken.PURPOSE_MAGIC_LOGIN,
+        exclude_id=auth_token.id,
+    )
+    db.session.commit()
+
+    login_user(user)
+    flash("You have been logged in using your magic link.", "success")
+    return redirect(url_for("dashboard"))
 
 
 # ---------------------------------------------------------------------------
@@ -420,14 +658,14 @@ def admin_users():
 def admin_create_user():
     form = CreateUserForm()
     if form.validate_on_submit():
-        existing = User.query.filter_by(email=form.email.data.lower().strip()).first()
+        existing = User.query.filter_by(email=_normalise_email(form.email.data)).first()
         if existing:
             flash("A user with that email already exists.", "danger")
             return render_template("admin_create_user.html", form=form)
 
         user = User(
             name=form.name.data,
-            email=form.email.data.lower().strip(),
+            email=_normalise_email(form.email.data),
             role=form.role.data,
         )
         user.set_password(form.password.data)
@@ -501,12 +739,12 @@ def create_admin():
     name = click.prompt("Admin name")
     password = click.prompt("Admin password", hide_input=True, confirmation_prompt=True)
 
-    existing = User.query.filter_by(email=email.lower().strip()).first()
+    existing = User.query.filter_by(email=_normalise_email(email)).first()
     if existing:
         click.echo(f"User {email} already exists.")
         return
 
-    user = User(name=name, email=email.lower().strip(), role="admin")
+    user = User(name=name, email=_normalise_email(email), role="admin")
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
