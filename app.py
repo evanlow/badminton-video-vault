@@ -182,6 +182,14 @@ def _generic_email_confirmation(link_type):
     return "If an active account exists for that email, a magic login link has been sent."
 
 
+def _auth_email_log_label(purpose):
+    if purpose == AuthToken.PURPOSE_RESET_PASSWORD:
+        return "reset"
+    if purpose == AuthToken.PURPOSE_MAGIC_LOGIN:
+        return "magic-login"
+    return "unknown"
+
+
 def _is_auth_email_throttled(user_id, purpose):
     cooldown_seconds = int(app.config["AUTH_EMAIL_COOLDOWN_SECONDS"])
     if cooldown_seconds <= 0:
@@ -259,7 +267,11 @@ def _issue_auth_token_email(user, purpose):
         raise ValueError(f"Unknown auth token purpose: {purpose}")
 
     if _is_auth_email_throttled(user.id, purpose):
-        logger.info("Skipping auth email for user_id=%s purpose=%s during cooldown", user.id, purpose)
+        logger.info(
+            "Skipping auth email for user_id=%s type=%s during cooldown",
+            user.id,
+            _auth_email_log_label(purpose),
+        )
         return
 
     raw_token, _ = AuthToken.create_for_user(
@@ -277,7 +289,12 @@ def _issue_auth_token_email(user, purpose):
         else:
             _send_magic_login_email(user, raw_token)
     except EmailDeliveryError as exc:
-        logger.error("Auth email delivery failed for user_id=%s purpose=%s: %s", user.id, purpose, exc)
+        logger.error(
+            "Auth email delivery failed for user_id=%s type=%s: %s",
+            user.id,
+            _auth_email_log_label(purpose),
+            exc,
+        )
 
 
 def _find_active_user_by_email(email):
