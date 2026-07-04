@@ -52,5 +52,6 @@ class Config:
     APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:5000").rstrip("/")
     PASSWORD_RESET_TOKEN_TTL_MINUTES = int(os.environ.get("PASSWORD_RESET_TOKEN_TTL_MINUTES", 30))
     MAGIC_LOGIN_TOKEN_TTL_MINUTES = int(os.environ.get("MAGIC_LOGIN_TOKEN_TTL_MINUTES", 15))
+    AUTH_EMAIL_COOLDOWN_SECONDS = int(os.environ.get("AUTH_EMAIL_COOLDOWN_SECONDS", 60))
 
     MAX_CONTENT_LENGTH = 2 * 1024 * 1024 * 1024  # 2 GB upload limit

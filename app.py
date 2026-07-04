@@ -182,6 +182,20 @@ def _generic_email_confirmation(link_type):
     return "If an active account exists for that email, a magic login link has been sent."
 
 
+def _is_auth_email_throttled(user_id, purpose):
+    cooldown_seconds = int(app.config["AUTH_EMAIL_COOLDOWN_SECONDS"])
+    if cooldown_seconds <= 0:
+        return False
+
+    cutoff = datetime.utcnow() - timedelta(seconds=cooldown_seconds)
+    return db.session.query(AuthToken.id).filter(
+        AuthToken.user_id == user_id,
+        AuthToken.purpose == purpose,
+        AuthToken.used_at.is_(None),
+        AuthToken.created_at >= cutoff,
+    ).first() is not None
+
+
 def _send_password_reset_email(user, raw_token):
     reset_url = _app_link("reset_password", token=raw_token)
     ttl = int(app.config["PASSWORD_RESET_TOKEN_TTL_MINUTES"])
@@ -243,6 +257,10 @@ def _issue_auth_token_email(user, purpose):
         ttl = int(app.config["MAGIC_LOGIN_TOKEN_TTL_MINUTES"])
     else:
         raise ValueError(f"Unknown auth token purpose: {purpose}")
+
+    if _is_auth_email_throttled(user.id, purpose):
+        logger.info("Skipping auth email for user_id=%s purpose=%s during cooldown", user.id, purpose)
+        return
 
     raw_token, _ = AuthToken.create_for_user(
         user=user,

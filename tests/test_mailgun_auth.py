@@ -13,7 +13,8 @@ from email_service import send_mailgun_email
 def extract_token(mock_send, path_prefix):
     body = mock_send.call_args.args[2]
     match = re.search(rf"{re.escape(path_prefix)}/([A-Za-z0-9_-]+)", body)
-    assert match, body
+    if not match:
+        raise AssertionError(body)
     return match.group(1)
 
 
@@ -58,6 +59,19 @@ class TestForgotPasswordFlow(BaseTestCase):
     def test_known_active_user_gets_reset_token(self):
         with patch("app.send_mailgun_email") as send:
             r = self.client.post("/forgot-password", data={"email": "owner@test.com"}, follow_redirects=True)
+        self.assertIn(b"If an active account exists", r.data)
+        send.assert_called_once()
+        self.assertEqual(AuthToken.query.filter_by(purpose=AuthToken.PURPOSE_RESET_PASSWORD).count(), 1)
+
+    def test_reset_email_requests_are_throttled_during_cooldown(self):
+        original_cooldown = app.config["AUTH_EMAIL_COOLDOWN_SECONDS"]
+        self.addCleanup(app.config.update, {"AUTH_EMAIL_COOLDOWN_SECONDS": original_cooldown})
+        app.config["AUTH_EMAIL_COOLDOWN_SECONDS"] = 60
+
+        with patch("app.send_mailgun_email") as send:
+            self.client.post("/forgot-password", data={"email": "owner@test.com"}, follow_redirects=True)
+            r = self.client.post("/forgot-password", data={"email": "owner@test.com"}, follow_redirects=True)
+
         self.assertIn(b"If an active account exists", r.data)
         send.assert_called_once()
         self.assertEqual(AuthToken.query.filter_by(purpose=AuthToken.PURPOSE_RESET_PASSWORD).count(), 1)
