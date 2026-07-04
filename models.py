@@ -1,7 +1,17 @@
 from datetime import datetime
+from flask import current_app
 from flask_login import UserMixin
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import generate_password_hash, check_password_hash
 from extensions import db
+
+# Token lifetimes, in seconds.
+RESET_PASSWORD_TOKEN_MAX_AGE = 30 * 60  # 30 minutes
+MAGIC_LOGIN_TOKEN_MAX_AGE = 15 * 60  # 15 minutes
+
+
+def _get_serializer():
+    return URLSafeTimedSerializer(current_app.config["SECRET_KEY"])
 
 
 class User(UserMixin, db.Model):
@@ -14,6 +24,9 @@ class User(UserMixin, db.Model):
     role = db.Column(db.String(20), nullable=False, default="user")  # "admin" or "user"
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    # Timestamp of the last successful magic-link login, used to prevent a
+    # single magic-link token from being replayed more than once.
+    last_magic_login_at = db.Column(db.DateTime, nullable=True)
 
     videos = db.relationship("Video", back_populates="uploader", lazy="dynamic")
 
@@ -26,6 +39,67 @@ class User(UserMixin, db.Model):
     @property
     def is_admin(self):
         return self.role == "admin"
+
+    # ------------------------------------------------------------------
+    # Password reset tokens
+    # ------------------------------------------------------------------
+
+    def get_reset_password_token(self):
+        """Return a signed, time-limited token for resetting this user's password.
+
+        The token embeds a fragment of the current password hash so that it
+        is automatically invalidated once the password has been changed.
+        """
+        serializer = _get_serializer()
+        return serializer.dumps(
+            {"user_id": self.id, "hash": self.password_hash[:32]},
+            salt="password-reset",
+        )
+
+    @staticmethod
+    def verify_reset_password_token(token):
+        serializer = _get_serializer()
+        try:
+            data = serializer.loads(
+                token, salt="password-reset", max_age=RESET_PASSWORD_TOKEN_MAX_AGE
+            )
+        except (BadSignature, SignatureExpired):
+            return None
+        user = db.session.get(User, data.get("user_id"))
+        if not user or data.get("hash") != user.password_hash[:32]:
+            return None
+        return user
+
+    # ------------------------------------------------------------------
+    # Magic-link login tokens
+    # ------------------------------------------------------------------
+
+    def get_magic_login_token(self):
+        serializer = _get_serializer()
+        return serializer.dumps({"user_id": self.id}, salt="magic-login")
+
+    @staticmethod
+    def verify_magic_login_token(token):
+        serializer = _get_serializer()
+        try:
+            data, issued_at = serializer.loads(
+                token,
+                salt="magic-login",
+                max_age=MAGIC_LOGIN_TOKEN_MAX_AGE,
+                return_timestamp=True,
+            )
+        except (BadSignature, SignatureExpired):
+            return None
+        user = db.session.get(User, data.get("user_id"))
+        if not user or not user.is_active:
+            return None
+        issued_at = issued_at.replace(tzinfo=None)
+        if user.last_magic_login_at and issued_at <= user.last_magic_login_at:
+            # This token has already been used to log in once.
+            return None
+        user.last_magic_login_at = datetime.utcnow()
+        db.session.commit()
+        return user
 
     def __repr__(self):
         return f"<User {self.email}>"
