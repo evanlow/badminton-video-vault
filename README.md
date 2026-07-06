@@ -47,6 +47,9 @@ cp .env.example .env
 flask init-db
 ```
 
+Note: by default, the app now auto-creates missing tables on startup (`AUTO_CREATE_DB=true`).
+The `flask init-db` command is still available and safe to run.
+
 ### 4. Create an admin user
 
 ```bash
@@ -68,6 +71,7 @@ The app will be available at `http://localhost:5000`.
 | `FLASK_SECRET_KEY` | Flask session secret (change in production!) |
 | `FLASK_ENV` | `development` or `production` |
 | `DATABASE_URL` | SQLAlchemy DB URI (default: SQLite) |
+| `AUTO_CREATE_DB` | Auto-create missing DB tables at startup (default: `true`) |
 | `AWS_ACCESS_KEY_ID` | AWS credentials |
 | `AWS_SECRET_ACCESS_KEY` | AWS credentials |
 | `AWS_REGION` | AWS region (e.g. `us-east-1`) |

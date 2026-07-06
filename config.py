@@ -26,6 +26,7 @@ class Config:
     SECRET_KEY = _get_secret_key()
     SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", "sqlite:///badminton_vault.db")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    AUTO_CREATE_DB = _env_bool("AUTO_CREATE_DB", default=True)
 
     AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")

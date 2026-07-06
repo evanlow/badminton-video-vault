@@ -68,6 +68,10 @@ def create_app(config_class=Config):
 
 app = create_app()
 
+if app.config.get("AUTO_CREATE_DB", False):
+    with app.app_context():
+        db.create_all()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
