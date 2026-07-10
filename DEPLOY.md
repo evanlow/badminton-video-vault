@@ -1057,7 +1057,7 @@ Understanding AWS pricing helps you estimate and manage costs.
 | Large video uploads time out | Nginx `proxy_read_timeout` too short | Already set to `300s` in the Nginx config in [Part 10](#part-10--configure-nginx-as-a-reverse-proxy); increase further if needed |
 | Video playback fails after deploy | Presigned URL expiry or S3 region mismatch | Verify `AWS_REGION` in `.env` matches the bucket's actual region |
 | Domain doesn't load the app | DNS not propagated yet, or A record missing/incorrect | Run `dig +short yourdomain.com` and confirm it returns your Elastic IP; wait for propagation before retrying |
-| Certbot fails with "DNS problem: NXDOMAIN" or similar | Domain's A record isn't pointing at the instance yet | Re-check the A record in your registrar's DNS settings (see [Part 11.1](#part-11--custom-domain-setup-and-https-with-lets-encrypt-recommended)) and wait for propagation before re-running `certbot` |
+| Certbot fails with "DNS problem: NXDOMAIN" or similar | Domain's A record isn't pointing at the instance yet | Re-check the A record in your registrar's DNS settings (see [Part 11.1](#111--point-your-domain-at-the-elastic-ip)) and wait for propagation before re-running `certbot` |
 
 ### Getting Help
 
