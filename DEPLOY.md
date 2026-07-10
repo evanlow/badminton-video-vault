@@ -1,23 +1,43 @@
-# Deploying to AWS EC2 from GitHub
+# Deploying Badminton Video Vault to AWS
 
-This guide walks through deploying Badminton Video Vault to a single AWS EC2 instance, with a GitHub Actions pipeline that automatically tests and deploys every push to `main`.
-
-**Before you begin:** complete [AWS_setup.md](AWS_setup.md) first — you will need your S3 bucket, IAM credentials, and `FLASK_SECRET_KEY` ready before starting Part 3.
+This guide is the single, end-to-end walkthrough for taking Badminton Video Vault from nothing to a fully running production deployment on AWS — provisioning the AWS resources (S3, IAM), launching and configuring an EC2 instance, and setting up continuous deployment from GitHub. Follow the parts in order; each part builds on the previous one.
 
 ---
 
 ## Table of Contents
 
-1. [Architecture Overview](#architecture-overview)
-2. [Part 1 — Launch an EC2 Instance](#part-1--launch-an-ec2-instance)
-3. [Part 2 — Connect and Prepare the Server](#part-2--connect-and-prepare-the-server)
-4. [Part 3 — Deploy the Application](#part-3--deploy-the-application)
-5. [Part 4 — Configure Gunicorn as a Systemd Service](#part-4--configure-gunicorn-as-a-systemd-service)
-6. [Part 5 — Configure Nginx as a Reverse Proxy](#part-5--configure-nginx-as-a-reverse-proxy)
-7. [Part 6 — HTTPS with Let's Encrypt (Recommended)](#part-6--https-with-lets-encrypt-recommended)
-8. [Part 7 — Continuous Deployment from GitHub](#part-7--continuous-deployment-from-github)
-9. [Maintenance](#maintenance)
-10. [Troubleshooting](#troubleshooting)
+1. [Prerequisites](#prerequisites)
+2. [Architecture Overview](#architecture-overview)
+3. [Part 1 — Create an AWS Account](#part-1--create-an-aws-account)
+4. [Part 2 — Create and Configure an S3 Bucket](#part-2--create-and-configure-an-s3-bucket)
+5. [Part 3 — Set Up IAM User and Permissions](#part-3--set-up-iam-user-and-permissions)
+6. [Part 4 — Generate Access Keys](#part-4--generate-access-keys)
+7. [Part 5 — Configure CORS (Optional)](#part-5--configure-cors-optional)
+8. [Part 6 — Launch an EC2 Instance](#part-6--launch-an-ec2-instance)
+9. [Part 7 — Connect and Prepare the Server](#part-7--connect-and-prepare-the-server)
+10. [Part 8 — Deploy the Application](#part-8--deploy-the-application)
+11. [Part 9 — Configure Gunicorn as a Systemd Service](#part-9--configure-gunicorn-as-a-systemd-service)
+12. [Part 10 — Configure Nginx as a Reverse Proxy](#part-10--configure-nginx-as-a-reverse-proxy)
+13. [Part 11 — HTTPS with Let's Encrypt (Recommended)](#part-11--https-with-lets-encrypt-recommended)
+14. [Part 12 — Continuous Deployment from GitHub](#part-12--continuous-deployment-from-github)
+15. [Database Options for Production](#database-options-for-production)
+16. [Verify the Setup](#verify-the-setup)
+17. [Maintenance](#maintenance)
+18. [Security Best Practices](#security-best-practices)
+19. [Cost Considerations](#cost-considerations)
+20. [Troubleshooting](#troubleshooting)
+
+---
+
+## Prerequisites
+
+Before you begin, ensure you have the following:
+
+- A valid email address for AWS account registration
+- A credit/debit card for AWS billing (free tier is available for new accounts)
+- Python 3.8+ and the application dependencies installed locally (see [README.md](README.md))
+- Basic familiarity with the AWS Management Console
+- A GitHub repository fork/clone of Badminton Video Vault that you can deploy from
 
 ---
 
@@ -43,11 +63,177 @@ EC2 Instance (Ubuntu 22.04)
 AWS S3  (video file storage, presigned URLs for playback)
 ```
 
+The application never exposes S3 objects publicly — uploads and downloads are performed server-side, and video playback/download uses time-limited presigned URLs.
+
+The first five parts of this guide set up the AWS resources (account, S3 bucket, IAM user, access keys). The remaining parts provision the EC2 server and deploy the application, using the credentials created earlier.
+
 ---
 
-## Part 1 — Launch an EC2 Instance
+## Part 1 — Create an AWS Account
 
-### 1.1 — Choose an AMI and Instance Type
+If you do not already have an AWS account:
+
+1. Go to [https://aws.amazon.com/](https://aws.amazon.com/) and click **Create an AWS Account**.
+2. Follow the prompts to provide your email, set a password, and enter payment details.
+3. Choose the **Basic (Free)** support plan unless you require premium support.
+4. Complete the identity verification process.
+5. Sign in to the [AWS Management Console](https://console.aws.amazon.com/).
+
+> **Note:** New AWS accounts are eligible for the [AWS Free Tier](https://aws.amazon.com/free/), which includes 5 GB of S3 Standard storage, 20,000 GET requests, and 2,000 PUT requests per month for 12 months, plus 750 hours/month of `t2.micro` EC2 usage.
+
+---
+
+## Part 2 — Create and Configure an S3 Bucket
+
+Amazon S3 (Simple Storage Service) is used to store all uploaded video files.
+
+### 2.1 — Create the Bucket
+
+1. Navigate to the **S3** service in the AWS Management Console:
+   - Search for "S3" in the top search bar, or find it under **Services → Storage → S3**.
+
+2. Click **Create bucket**.
+
+3. Configure the bucket:
+
+   | Setting | Recommended Value |
+   |---------|-------------------|
+   | **Bucket name** | Choose a globally unique name (e.g., `badminton-video-vault-yourname`) |
+   | **AWS Region** | Select the region closest to your users (e.g., `us-east-1`, `ap-southeast-1`) |
+   | **Object Ownership** | ACLs disabled (recommended) |
+
+4. **Block Public Access settings** — this is critical for security:
+   - ✅ Check **Block *all* public access**
+   - This ensures no video file is ever accidentally exposed to the internet
+
+5. **Bucket Versioning** — leave as **Disabled** unless you want to retain previous versions of overwritten files (adds storage cost).
+
+6. **Default encryption** — leave as **Server-side encryption with Amazon S3 managed keys (SSE-S3)** (the default).
+
+7. Click **Create bucket**.
+
+> **Record your bucket name** — you will use it as the `S3_BUCKET_NAME` environment variable later.
+
+### 2.2 — Verify Public Access Is Blocked
+
+1. Open your bucket in the S3 console.
+2. Go to the **Permissions** tab.
+3. Under **Block public access (bucket settings)**, confirm all four options are set to **On**:
+   - Block public access to buckets and objects granted through *new* access control lists (ACLs)
+   - Block public access to buckets and objects granted through *any* access control lists (ACLs)
+   - Block public access to buckets and objects granted through *new* public bucket or access point policies
+   - Restrict access to buckets and objects granted through *any* public bucket or access point policies
+
+### 2.3 — Lifecycle Rules (Optional)
+
+If you want to automatically manage storage costs, you can add lifecycle rules:
+
+1. Go to the **Management** tab in your bucket.
+2. Click **Create lifecycle rule**.
+3. Example rules:
+   - Move objects to **S3 Glacier** after 90 days (for archival)
+   - Permanently delete incomplete multipart uploads after 7 days
+
+---
+
+## Part 3 — Set Up IAM User and Permissions
+
+IAM (Identity and Access Management) controls who can access your AWS resources. You will create a dedicated IAM user for the application with the minimum permissions needed.
+
+### Step 1: Create an IAM Policy
+
+1. Navigate to **IAM** in the AWS Management Console (search for "IAM" in the top bar).
+2. In the left sidebar, click **Policies**, then **Create policy**.
+3. Click the **JSON** tab and paste the following policy:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "BadmintonVideoVaultS3Access",
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:DeleteObject"
+            ],
+            "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/*"
+        }
+    ]
+}
+```
+
+4. Replace `YOUR-BUCKET-NAME` with the actual name of the bucket you created.
+5. Click **Next**.
+6. Name the policy (e.g., `BadmintonVideoVaultS3Policy`) and add an optional description.
+7. Click **Create policy**.
+
+> **Important:** This policy follows the principle of least privilege — the application can only put, get, and delete objects within the specific bucket. It cannot list buckets, modify bucket settings, or access other AWS services.
+
+### Step 2: Create an IAM User
+
+1. In the IAM console, go to **Users** in the left sidebar.
+2. Click **Create user**.
+3. Enter a user name (e.g., `badminton-video-vault-app`).
+4. **Do NOT** check "Provide user access to the AWS Management Console" — this user only needs programmatic access.
+5. Click **Next**.
+
+### Step 3: Attach the Policy
+
+1. On the **Set permissions** page, select **Attach policies directly**.
+2. Search for the policy you created (`BadmintonVideoVaultS3Policy`).
+3. Check the box next to it.
+4. Click **Next**, then **Create user**.
+
+---
+
+## Part 4 — Generate Access Keys
+
+The application authenticates to AWS using access keys (an Access Key ID and Secret Access Key pair).
+
+1. In the IAM console, go to **Users** and click on the user you just created.
+2. Go to the **Security credentials** tab.
+3. Under **Access keys**, click **Create access key**.
+4. Select **Application running outside AWS** as the use case.
+5. Click **Next**, then **Create access key**.
+6. **Important:** Copy both the **Access Key ID** and **Secret Access Key** immediately. The Secret Access Key will not be shown again.
+
+> ⚠️ **Security Warning:** Never commit access keys to source control. Store them securely and treat them like passwords.
+
+> **Checkpoint:** By this point you should have your **S3 bucket name**, **AWS region**, **Access Key ID**, and **Secret Access Key** recorded somewhere safe. You will need all four values in Part 8 when configuring the production `.env` file.
+
+---
+
+## Part 5 — Configure CORS (Optional)
+
+CORS (Cross-Origin Resource Sharing) configuration is needed if your application serves content from a different domain than where S3 presigned URLs point. The browser fetches video playback URLs directly from S3 using presigned URLs, so CORS may be required depending on your frontend domain/origin setup. If you encounter CORS errors during video playback:
+
+1. Open your bucket in the S3 console.
+2. Go to the **Permissions** tab.
+3. Scroll down to **Cross-origin resource sharing (CORS)** and click **Edit**.
+4. Add the following configuration:
+
+```json
+[
+    {
+        "AllowedHeaders": ["*"],
+        "AllowedMethods": ["GET", "PUT"],
+        "AllowedOrigins": ["https://yourdomain.com"],
+        "ExposeHeaders": ["ETag"],
+        "MaxAgeSeconds": 3600
+    }
+]
+```
+
+5. Replace `https://yourdomain.com` with your application's actual domain. For local development, use `http://localhost:5000`.
+6. Click **Save changes**.
+
+---
+
+## Part 6 — Launch an EC2 Instance
+
+### 6.1 — Choose an AMI and Instance Type
 
 1. In the AWS Management Console, navigate to **EC2 → Instances → Launch instances**.
 2. Set **Name**: `badminton-video-vault`.
@@ -58,7 +244,7 @@ AWS S3  (video file storage, presigned URLs for playback)
    - **t2.micro** — free tier eligible (750 hours/month for 12 months).
    - If your free tier has expired, **t3.micro** (~$0.01/hour) is the next cheapest option.
 
-### 1.2 — Create a Key Pair
+### 6.2 — Create a Key Pair
 
 1. Under **Key pair (login)**, click **Create new key pair**.
 2. Name it `badminton-vault-key`.
@@ -72,7 +258,7 @@ AWS S3  (video file storage, presigned URLs for playback)
 
 > ⚠️ **You cannot re-download this file.** If you lose it, you will need to create a new key pair and replace the instance.
 
-### 1.3 — Configure the Security Group
+### 6.3 — Configure the Security Group
 
 Under **Network settings**, click **Edit** and configure inbound rules:
 
@@ -84,16 +270,16 @@ Under **Network settings**, click **Edit** and configure inbound rules:
 
 > **Security note on SSH port 22:** Allowing SSH from `0.0.0.0/0` is acceptable as long as password authentication is disabled (Ubuntu's default) and you keep your `.pem` key secure. If you prefer stricter access, restrict port 22 to your home IP address — but note that GitHub Actions deployment will then require a different approach (e.g., AWS SSM Session Manager).
 
-### 1.4 — Configure Storage
+### 6.4 — Configure Storage
 
 Under **Configure storage**, set:
 - **8 GiB gp3** root volume (free tier provides 30 GB; 8 GB is sufficient since videos live in S3).
 
-### 1.5 — Launch
+### 6.5 — Launch
 
 Click **Launch instance** and wait for the **Instance state** to show **Running**.
 
-### 1.6 — Assign an Elastic IP
+### 6.6 — Assign an Elastic IP
 
 Without an Elastic IP, your instance's public IP changes every time it stops and starts.
 
@@ -101,13 +287,13 @@ Without an Elastic IP, your instance's public IP changes every time it stops and
 2. Click **Allocate Elastic IP address → Allocate**.
 3. Select the newly allocated IP, then **Actions → Associate Elastic IP address**.
 4. Select your instance and click **Associate**.
-5. **Record this IP address** — you will need it throughout this guide.
+5. **Record this IP address** — you will need it throughout the rest of this guide.
 
 ---
 
-## Part 2 — Connect and Prepare the Server
+## Part 7 — Connect and Prepare the Server
 
-### 2.1 — SSH Into the Instance
+### 7.1 — SSH Into the Instance
 
 ```bash
 ssh -i ~/.ssh/badminton-vault-key.pem ubuntu@YOUR_ELASTIC_IP
@@ -115,13 +301,13 @@ ssh -i ~/.ssh/badminton-vault-key.pem ubuntu@YOUR_ELASTIC_IP
 
 Replace `YOUR_ELASTIC_IP` with the Elastic IP you just assigned.
 
-### 2.2 — Update Packages
+### 7.2 — Update Packages
 
 ```bash
 sudo apt update && sudo apt upgrade -y
 ```
 
-### 2.3 — Install System Dependencies
+### 7.3 — Install System Dependencies
 
 ```bash
 sudo apt install -y python3 python3-pip python3-venv git nginx
@@ -133,7 +319,7 @@ Verify Python is 3.10 or later:
 python3 --version
 ```
 
-### 2.4 — Create the Application Directory
+### 7.4 — Create the Application Directory
 
 ```bash
 sudo mkdir -p /srv/badminton-video-vault
@@ -148,9 +334,9 @@ mkdir -p /srv/badminton-video-vault/data
 
 ---
 
-## Part 3 — Deploy the Application
+## Part 8 — Deploy the Application
 
-### 3.1 — Clone the Repository
+### 8.1 — Clone the Repository
 
 ```bash
 cd /srv
@@ -160,14 +346,14 @@ cd badminton-video-vault
 
 Replace `YOUR_GITHUB_USERNAME` with your GitHub username. If the repository is private, you will need to authenticate — the easiest approach is to use a [GitHub Personal Access Token](https://github.com/settings/tokens) as the password when prompted, or set up an SSH deploy key.
 
-### 3.2 — Create and Activate the Virtual Environment
+### 8.2 — Create and Activate the Virtual Environment
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
 
-### 3.3 — Install Python Dependencies
+### 8.3 — Install Python Dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -175,7 +361,7 @@ pip install -r requirements.txt
 
 This includes `gunicorn`, which is required to serve the app in production.
 
-### 3.4 — Create the Production `.env` File
+### 8.4 — Create the Production `.env` File
 
 The `.env` file is **not** in the repository (it is gitignored). Create it directly on the server:
 
@@ -183,7 +369,7 @@ The `.env` file is **not** in the repository (it is gitignored). Create it direc
 nano /srv/badminton-video-vault/.env
 ```
 
-Paste and fill in all values:
+Paste and fill in all values, using the S3 bucket, region, and access keys you recorded in Parts 2–4:
 
 ```ini
 # Flask
@@ -193,7 +379,7 @@ FLASK_ENV=production
 # Database — absolute path to keep it outside the app directory
 DATABASE_URL=sqlite:////srv/badminton-video-vault/data/badminton_vault.db
 
-# AWS S3 (from AWS_setup.md)
+# AWS S3 (from Parts 2-4)
 AWS_ACCESS_KEY_ID=AKIA...your-access-key-id...
 AWS_SECRET_ACCESS_KEY=your-secret-access-key
 AWS_REGION=us-east-1
@@ -209,7 +395,23 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 
 > **Important:** The `DATABASE_URL` uses four slashes (`sqlite:////`) to denote an absolute path on the filesystem. This ensures the database lives at `/srv/badminton-video-vault/data/badminton_vault.db` regardless of the working directory.
 
-### 3.5 — Initialise the Database
+#### Environment Variable Reference
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `AWS_ACCESS_KEY_ID` | The Access Key ID from the IAM user created in Part 3 | `AKIAIOSFODNN7EXAMPLE` |
+| `AWS_SECRET_ACCESS_KEY` | The Secret Access Key from the IAM user created in Part 3 | `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` |
+| `AWS_REGION` | The AWS region where your bucket is located | `us-east-1`, `ap-southeast-1`, `eu-west-1` |
+| `S3_BUCKET_NAME` | The exact name of your S3 bucket | `badminton-video-vault-yourname` |
+| `PRESIGNED_URL_EXPIRY` | How long presigned URLs remain valid (in seconds) | `3600` (1 hour) |
+
+**Notes on Presigned URL Expiry:**
+- **Shorter expiry** (e.g., 900 seconds / 15 minutes) is more secure — URLs become invalid faster if shared.
+- **Longer expiry** (e.g., 7200 seconds / 2 hours) is more convenient for long viewing sessions.
+- The default of 3600 seconds (1 hour) provides a good balance.
+- Share links have their own 30-day expiry managed at the application level, but the presigned URLs within them still respect this setting.
+
+### 8.5 — Initialise the Database
 
 **Run these commands only once on first deploy.** Running `init-db` again on an existing installation will drop and recreate all tables, erasing all data.
 
@@ -222,7 +424,7 @@ flask create-admin
 
 Follow the prompts for `create-admin` to set up the admin account.
 
-### 3.6 — Smoke-Test the Application Manually
+### 8.6 — Smoke-Test the Application Manually
 
 Before configuring the service, verify the app starts:
 
@@ -238,11 +440,11 @@ Press `Ctrl+C` to stop Gunicorn when done.
 
 ---
 
-## Part 4 — Configure Gunicorn as a Systemd Service
+## Part 9 — Configure Gunicorn as a Systemd Service
 
 A systemd service keeps Gunicorn running, starts it automatically on boot, and restarts it if it crashes.
 
-### 4.1 — Create the Service File
+### 9.1 — Create the Service File
 
 ```bash
 sudo nano /etc/systemd/system/badminton-vault.service
@@ -272,14 +474,14 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-### 4.2 — Create the Log Directory
+### 9.2 — Create the Log Directory
 
 ```bash
 sudo mkdir -p /var/log/badminton-vault
 sudo chown ubuntu:ubuntu /var/log/badminton-vault
 ```
 
-### 4.3 — Enable and Start the Service
+### 9.3 — Enable and Start the Service
 
 ```bash
 sudo systemctl daemon-reload
@@ -296,11 +498,11 @@ journalctl -u badminton-vault -n 50
 
 ---
 
-## Part 5 — Configure Nginx as a Reverse Proxy
+## Part 10 — Configure Nginx as a Reverse Proxy
 
 Nginx accepts incoming HTTP/HTTPS traffic and forwards it to Gunicorn via a Unix socket.
 
-### 5.1 — Create the Nginx Server Block
+### 10.1 — Create the Nginx Server Block
 
 ```bash
 sudo nano /etc/nginx/sites-available/badminton-vault
@@ -328,7 +530,7 @@ server {
 }
 ```
 
-### 5.2 — Enable the Site
+### 10.2 — Enable the Site
 
 ```bash
 sudo ln -s /etc/nginx/sites-available/badminton-vault /etc/nginx/sites-enabled/
@@ -338,19 +540,19 @@ sudo systemctl restart nginx
 
 If `nginx -t` reports errors, review the config file for typos.
 
-### 5.3 — Verify
+### 10.3 — Verify
 
 Navigate to `http://YOUR_ELASTIC_IP` in a browser. You should see the login page served through Nginx.
 
 ---
 
-## Part 6 — HTTPS with Let's Encrypt (Recommended)
+## Part 11 — HTTPS with Let's Encrypt (Recommended)
 
 HTTPS is strongly recommended before using the app with real data. This requires a **domain name** pointing to your Elastic IP (not just a bare IP address).
 
 If you do not have a domain yet, skip this part and revisit it when you add one.
 
-### 6.1 — Point a Domain at Your Elastic IP
+### 11.1 — Point a Domain at Your Elastic IP
 
 In your DNS provider, create an A record:
 
@@ -363,13 +565,13 @@ TTL: 300
 
 Wait for DNS to propagate (usually a few minutes).
 
-### 6.2 — Install Certbot
+### 11.2 — Install Certbot
 
 ```bash
 sudo apt install -y certbot python3-certbot-nginx
 ```
 
-### 6.3 — Obtain the Certificate
+### 11.3 — Obtain the Certificate
 
 ```bash
 sudo certbot --nginx -d yourdomain.com
@@ -377,7 +579,7 @@ sudo certbot --nginx -d yourdomain.com
 
 Follow the prompts. Certbot will automatically edit your Nginx config to enable HTTPS and redirect HTTP to HTTPS.
 
-### 6.4 — Auto-Renewal
+### 11.4 — Auto-Renewal
 
 Certbot installs a systemd timer that renews the certificate automatically. Verify it:
 
@@ -385,13 +587,13 @@ Certbot installs a systemd timer that renews the certificate automatically. Veri
 sudo systemctl status certbot.timer
 ```
 
-### 6.5 — Update the Nginx Config
+### 11.5 — Update the Nginx Config
 
 After certbot runs, update the `server_name` in `/etc/nginx/sites-available/badminton-vault` from the IP address to your domain name, then restart Nginx.
 
 ---
 
-## Part 7 — Continuous Deployment from GitHub
+## Part 12 — Continuous Deployment from GitHub
 
 This GitHub Actions workflow automatically:
 1. Runs the full smoke test suite (67 tests) in an isolated environment.
@@ -399,7 +601,7 @@ This GitHub Actions workflow automatically:
 
 A failed test blocks the deploy — satisfying the prime directive requirement that the regression suite must be 100% green before any release.
 
-### 7.1 — Create the GitHub Actions Workflow File
+### 12.1 — Create the GitHub Actions Workflow File
 
 In your local repository, create the following file:
 
@@ -472,7 +674,7 @@ jobs:
             sudo systemctl is-active --quiet badminton-vault && echo "Service is running." || (echo "Service failed to start!" && exit 1)
 ```
 
-### 7.2 — Add GitHub Secrets
+### 12.2 — Add GitHub Secrets
 
 The workflow needs two secrets stored in your GitHub repository:
 
@@ -491,7 +693,7 @@ The workflow needs two secrets stored in your GitHub repository:
    ```
    Select and copy everything, then paste it into the secret value.
 
-### 7.3 — Push the Workflow
+### 12.3 — Push the Workflow
 
 ```bash
 git add .github/workflows/deploy.yml requirements.txt
@@ -505,7 +707,7 @@ Navigate to your GitHub repository → **Actions**. You should see the workflow 
 - Run all 67 smoke tests.
 - If they all pass, SSH into EC2 and deploy.
 
-### 7.4 — How Each Subsequent Deploy Works
+### 12.4 — How Each Subsequent Deploy Works
 
 Every time you push to `main`:
 
@@ -534,7 +736,128 @@ GitHub Actions spins up a fresh runner
      Workflow passes. New version is live.
 ```
 
-> **First deploy only:** `flask init-db` and `flask create-admin` are one-time setup steps you ran manually in Part 3. The GitHub Actions deploy script intentionally does **not** run them — doing so would drop and recreate all tables on every deploy, erasing your data.
+> **First deploy only:** `flask init-db` and `flask create-admin` are one-time setup steps you ran manually in Part 8. The GitHub Actions deploy script intentionally does **not** run them — doing so would drop and recreate all tables on every deploy, erasing your data.
+
+---
+
+## Database Options for Production
+
+Locally the application uses SQLite (a single file: `badminton_vault.db`). The database is configured entirely through the `DATABASE_URL` environment variable, so the same application code works with any SQL database SQLAlchemy supports.
+
+### Option A — SQLite on an EBS-backed EC2 Instance (simplest, used by this guide)
+
+If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite works perfectly in production as long as the database file lives on an **EBS (Elastic Block Store)** volume, which persists across instance reboots and is independent of the root volume.
+
+- **When to use:** Personal or small-team vault; single server; no auto-scaling needed.
+- **Cost:** No extra database cost beyond the EC2 instance itself.
+- **How to configure:** Mount the EBS volume and point `DATABASE_URL` at the file path:
+
+  ```ini
+  DATABASE_URL=sqlite:////data/badminton_vault.db
+  ```
+
+  (Four slashes = absolute path on Unix.)
+
+- **Limitation:** Only one running instance can safely write to a SQLite file at a time. Not suitable if you later add auto-scaling or load balancing.
+
+### Option B — Amazon RDS (recommended for multi-instance or managed deployments)
+
+If you deploy to **Elastic Beanstalk, ECS, Fargate**, or any setup where the filesystem is ephemeral, you **must** use an external database. Amazon RDS is the natural AWS-managed choice.
+
+- **When to use:** Container-based deployments; Elastic Beanstalk; any auto-scaling topology.
+- **Recommended engine:** PostgreSQL (free tier: `db.t3.micro` for 12 months).
+- **Cost:** ~$15–25/month after free tier for a `db.t3.micro` instance.
+
+#### Steps to create an RDS PostgreSQL instance
+
+1. In the AWS console, navigate to **RDS → Create database**.
+2. Choose **Standard create** → **PostgreSQL**.
+3. Under **Templates**, select **Free tier** (if eligible).
+4. Set a **DB instance identifier**, **Master username**, and a strong **Master password**.
+5. Leave **DB instance class** as `db.t3.micro`.
+6. Under **Connectivity**, place the instance in the same VPC as your application server.
+7. Set **Public access** to **No** (the Flask app connects from inside the VPC; never expose RDS to the internet).
+8. Note the **Endpoint** hostname shown after the instance is created.
+
+#### Configure the application to use RDS
+
+1. Add `psycopg2-binary` to `requirements.txt` (PostgreSQL driver for Python).
+2. Set `DATABASE_URL` in your production environment:
+
+   ```ini
+   DATABASE_URL=postgresql://username:password@your-rds-endpoint.rds.amazonaws.com:5432/badminton_vault
+   ```
+
+3. Run the database initialisation command on first deploy:
+
+   ```bash
+   flask init-db
+   ```
+
+4. Create the admin account:
+
+   ```bash
+   flask create-admin
+   ```
+
+> **Security note:** Never put the RDS password in source control. Use environment variables or AWS Secrets Manager.
+
+### Summary
+
+| Scenario | Database choice |
+|----------|-----------------|
+| Single EC2 instance | SQLite on an EBS volume — no RDS needed |
+| Elastic Beanstalk / ECS / Fargate | RDS PostgreSQL or MySQL required |
+| Local development | SQLite (default) — no change needed |
+
+---
+
+## Verify the Setup
+
+After configuring everything, verify the integration works end-to-end.
+
+### 1. Test AWS Connectivity
+
+Run the following Python snippet (from the EC2 instance or locally with the same `.env`) to confirm your credentials and bucket are working:
+
+```bash
+python -c "
+import boto3
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('AWS_REGION')
+)
+
+bucket = os.getenv('S3_BUCKET_NAME')
+test_key = 'connectivity-test.txt'
+
+s3.put_object(Bucket=bucket, Key=test_key, Body=b'connectivity test')
+s3.delete_object(Bucket=bucket, Key=test_key)
+
+print(f'✅ Successfully connected to bucket: {bucket}')
+print(f'   Region: {os.getenv(\"AWS_REGION\")}')
+"
+```
+
+If successful, you will see a confirmation message. If not, check the [Troubleshooting](#troubleshooting) section below.
+
+### 2. Test the Running Service
+
+Navigate to `http://YOUR_ELASTIC_IP` (or your domain, if HTTPS is configured). You should see the login page served through Nginx.
+
+### 3. Test Upload and Playback
+
+1. Log in with your admin account.
+2. Navigate to the Upload page and upload a small test video.
+3. Confirm the video plays back on the Video Detail page.
+4. If downloads are enabled, confirm the download link works.
 
 ---
 
@@ -591,7 +914,92 @@ When you stop an EC2 instance, the Elastic IP remains assigned. Your data (SQLit
 
 ---
 
+## Security Best Practices
+
+Follow these guidelines to keep your deployment secure:
+
+### Credential Management
+
+- **Never commit `.env` or credentials** to version control. The `.gitignore` file already excludes `.env`.
+- **Rotate access keys** periodically (every 90 days is a common recommendation). To rotate:
+  1. Create a new access key in IAM.
+  2. Update your `.env` with the new key.
+  3. Verify the app works with the new key.
+  4. Delete the old access key in IAM.
+- **Use IAM roles** instead of access keys when deploying to AWS services (e.g., EC2, ECS, Lambda). This eliminates the need for long-lived credentials.
+
+### Bucket Security
+
+- Keep **Block Public Access** enabled at all times.
+- Enable **S3 access logging** to track who is accessing your bucket (go to bucket **Properties** → **Server access logging**).
+- Consider enabling **AWS CloudTrail** for auditing API calls to your bucket.
+- Enable **MFA Delete** on the bucket if you want additional protection against accidental or malicious object deletion.
+
+### Application Security
+
+- Use a strong, unique `FLASK_SECRET_KEY` in production.
+- Set `FLASK_ENV=production` when deploying (never use `development` in production).
+- Keep `PRESIGNED_URL_EXPIRY` as short as practical.
+- The application enforces a 2 GB upload limit — adjust `MAX_CONTENT_LENGTH` in `config.py` if needed.
+
+---
+
+## Cost Considerations
+
+Understanding AWS pricing helps you estimate and manage costs.
+
+### S3 Storage and Transfer
+
+| Component | Pricing (approximate, varies by region) |
+|-----------|------------------------------------------|
+| Storage (S3 Standard) | ~$0.023 per GB per month |
+| PUT requests (uploads) | ~$0.005 per 1,000 requests |
+| GET requests (playback/download) | ~$0.0004 per 1,000 requests |
+| Data Transfer Out (to internet) | ~$0.09 per GB (first 10 TB/month) |
+
+**Example estimate** for a small team with 50 videos averaging 500 MB each:
+- **Storage:** 25 GB × $0.023 = ~$0.58/month
+- **Uploads:** 50 PUTs = negligible
+- **Playback:** 500 GETs/month = negligible
+- **Data Transfer:** If 10 videos (5 GB) are streamed = ~$0.45/month
+- **Total:** ~$1.03/month
+
+### EC2
+
+- **t2.micro / t3.micro:** Free for the first 12 months (750 hours/month); ~$0.01/hour thereafter.
+- **8 GiB gp3 EBS volume:** Included in the free tier's 30 GB allowance; a few cents per month otherwise.
+- **Elastic IP:** Free while associated with a running instance.
+
+### Cost Optimization Tips
+
+- Use **S3 Intelligent-Tiering** if access patterns are unpredictable.
+- Set lifecycle rules to move old videos to **S3 Glacier** for long-term archival at ~$0.004/GB/month.
+- Monitor costs with [AWS Cost Explorer](https://console.aws.amazon.com/cost-management/home).
+- Set up **billing alerts** in AWS Budgets to avoid unexpected charges.
+
+---
+
 ## Troubleshooting
+
+### AWS / S3 / IAM Issues
+
+| Problem | Likely Cause | Solution |
+|---------|--------------|----------|
+| `NoCredentialsError` | Missing or incorrect AWS credentials | Verify `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in `.env` |
+| `AccessDenied` on upload | IAM policy does not include `s3:PutObject` | Review and update the IAM policy (see [Part 3](#part-3--set-up-iam-user-and-permissions)) |
+| `AccessDenied` on playback | IAM policy does not include `s3:GetObject` | Review and update the IAM policy |
+| `NoSuchBucket` | Bucket name in `.env` does not match the actual bucket | Double-check the `S3_BUCKET_NAME` value |
+| `InvalidBucketName` | Bucket name contains invalid characters | Bucket names must be 3–63 characters, lowercase, numbers, hyphens only |
+| Video playback fails (CORS error) | Missing CORS configuration on bucket | Add CORS rules (see [Part 5](#part-5--configure-cors-optional)) |
+| `SignatureDoesNotMatch` | Clock skew or incorrect secret key | Ensure your system clock is accurate; re-check the secret key |
+| Upload fails for large files | Server timeout or memory limits | Consider using multipart uploads or increasing server timeout settings |
+| `403 Forbidden` on presigned URL | URL has expired or region mismatch | Check `PRESIGNED_URL_EXPIRY` and ensure `AWS_REGION` matches the bucket's actual region |
+
+**Checking bucket region:** Your `AWS_REGION` environment variable **must** match the region where the bucket was created. Open your bucket in the S3 console → **Properties** tab → look for **AWS Region** under **Bucket overview**.
+
+**Viewing S3 access logs:** If you have access logging enabled, check the target bucket for detailed access records. Each log entry shows the requester, operation, and response status.
+
+### EC2 / Deployment Issues
 
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
@@ -601,5 +1009,13 @@ When you stop an EC2 instance, the Elastic IP remains assigned. Your data (SQLit
 | `flask init-db` says `no such table` | Database path issue | Verify `DATABASE_URL` in `.env` uses four slashes for absolute path; confirm the `data/` directory exists |
 | GitHub Actions deploy fails: "Permission denied (publickey)" | `EC2_SSH_KEY` secret is incorrect | Recopy the full `.pem` content (including header/footer lines) into the GitHub secret |
 | GitHub Actions deploy step is skipped | Smoke tests failed in the `test` job | Fix the failing tests first; check the Actions log for which test failed |
-| Large video uploads time out | Nginx `proxy_read_timeout` too short | Already set to `300s` in the Nginx config above; increase further if needed |
+| Large video uploads time out | Nginx `proxy_read_timeout` too short | Already set to `300s` in the Nginx config in [Part 10](#part-10--configure-nginx-as-a-reverse-proxy); increase further if needed |
 | Video playback fails after deploy | Presigned URL expiry or S3 region mismatch | Verify `AWS_REGION` in `.env` matches the bucket's actual region |
+
+### Getting Help
+
+- [AWS S3 Documentation](https://docs.aws.amazon.com/s3/)
+- [AWS IAM Documentation](https://docs.aws.amazon.com/iam/)
+- [AWS EC2 Documentation](https://docs.aws.amazon.com/ec2/)
+- [boto3 S3 Documentation](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html)
+- [AWS Free Tier FAQ](https://aws.amazon.com/free/free-tier-faqs/)
