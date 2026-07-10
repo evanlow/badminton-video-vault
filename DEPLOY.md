@@ -555,7 +555,7 @@ Navigate to `http://YOUR_ELASTIC_IP` in a browser. You should see the login page
 
 HTTPS is strongly recommended before using the app with real data, and using a domain name (instead of a bare IP address) makes the app easier to remember and share. This part covers pointing a domain you already own at your EC2 instance and then enabling HTTPS with a free Let's Encrypt certificate.
 
-If you do not have a domain yet, you can register one through a domain registrar (e.g. [Namecheap](https://www.namecheap.com/), [Google Domains](https://domains.google/)/[Squarespace Domains](https://www.squarespace.com/domains), [GoDaddy](https://www.godaddy.com/), or [Amazon Route 53](https://aws.amazon.com/route53/)), or you can skip this part for now and revisit it later — the app will still work over `http://YOUR_ELASTIC_IP`.
+If you do not have a domain yet, you can register one through a domain registrar (e.g. [Namecheap](https://www.namecheap.com/), [Squarespace Domains](https://www.squarespace.com/domains), [GoDaddy](https://www.godaddy.com/), or [Amazon Route 53](https://aws.amazon.com/route53/)), or you can skip this part for now and revisit it later — the app will still work over `http://YOUR_ELASTIC_IP`.
 
 ### 11.1 — Point Your Domain at the Elastic IP
 
@@ -589,7 +589,7 @@ dig +short yourdomain.com
 nslookup yourdomain.com
 ```
 
-The command should return your Elastic IP once propagation is complete. Do not continue to the next step until it does — Certbot's domain validation (Part 11.3) will fail otherwise.
+The command should return your Elastic IP once propagation is complete. Do not continue until it does — Certbot's domain validation (Part 11.4) will fail otherwise.
 
 ### 11.2 — Update the Nginx Server Block for Your Domain
 
