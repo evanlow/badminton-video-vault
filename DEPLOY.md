@@ -18,7 +18,7 @@ This guide is the single, end-to-end walkthrough for taking Badminton Video Vaul
 10. [Part 8 — Deploy the Application](#part-8--deploy-the-application)
 11. [Part 9 — Configure Gunicorn as a Systemd Service](#part-9--configure-gunicorn-as-a-systemd-service)
 12. [Part 10 — Configure Nginx as a Reverse Proxy](#part-10--configure-nginx-as-a-reverse-proxy)
-13. [Part 11 — HTTPS with Let's Encrypt (Recommended)](#part-11--https-with-lets-encrypt-recommended)
+13. [Part 11 — Custom Domain Setup and HTTPS with Let's Encrypt (Recommended)](#part-11--custom-domain-setup-and-https-with-lets-encrypt-recommended)
 14. [Part 12 — Continuous Deployment from GitHub](#part-12--continuous-deployment-from-github)
 15. [Database Options for Production](#database-options-for-production)
 16. [Verify the Setup](#verify-the-setup)
@@ -551,40 +551,82 @@ Navigate to `http://YOUR_ELASTIC_IP` in a browser. You should see the login page
 
 ---
 
-## Part 11 — HTTPS with Let's Encrypt (Recommended)
+## Part 11 — Custom Domain Setup and HTTPS with Let's Encrypt (Recommended)
 
-HTTPS is strongly recommended before using the app with real data. This requires a **domain name** pointing to your Elastic IP (not just a bare IP address).
+HTTPS is strongly recommended before using the app with real data, and using a domain name (instead of a bare IP address) makes the app easier to remember and share. This part covers pointing a domain you already own at your EC2 instance and then enabling HTTPS with a free Let's Encrypt certificate.
 
-If you do not have a domain yet, skip this part and revisit it when you add one.
+If you do not have a domain yet, you can register one through a domain registrar (e.g. [Namecheap](https://www.namecheap.com/), [Google Domains](https://domains.google/)/[Squarespace Domains](https://www.squarespace.com/domains), [GoDaddy](https://www.godaddy.com/), or [Amazon Route 53](https://aws.amazon.com/route53/)), or you can skip this part for now and revisit it later — the app will still work over `http://YOUR_ELASTIC_IP`.
 
-### 11.1 — Point a Domain at Your Elastic IP
+### 11.1 — Point Your Domain at the Elastic IP
 
-In your DNS provider, create an A record:
+Domain registrars provide a **DNS management** page (sometimes called "DNS settings", "Manage DNS", or "Advanced DNS") where you add records. The exact steps vary by registrar, but you are always creating the same kind of record:
 
 ```
 Type: A
-Name: @ (or subdomain, e.g. vault)
-Value: YOUR_ELASTIC_IP
-TTL: 300
+Host/Name: @ (root/apex domain, e.g. yourdomain.com)
+Value/Points to: YOUR_ELASTIC_IP
+TTL: 300 (or "Automatic")
 ```
 
-Wait for DNS to propagate (usually a few minutes).
+If you also want the app reachable at `www.yourdomain.com`, add a second record:
 
-### 11.2 — Install Certbot
+```
+Type: A
+Host/Name: www
+Value/Points to: YOUR_ELASTIC_IP
+TTL: 300 (or "Automatic")
+```
+
+If you'd rather use a subdomain only (e.g. `vault.yourdomain.com`) instead of the root domain, use that subdomain as the `Host/Name` value instead of `@`.
+
+> If your domain is hosted on **Amazon Route 53**, create the A records from the Route 53 console instead: **Hosted zones → your domain → Create record**, with **Record type** `A`, and **Value** set to your Elastic IP.
+
+DNS changes usually propagate within a few minutes, but can take up to 24-48 hours in rare cases. You can check propagation from the EC2 instance (or your local machine) with:
+
+```bash
+dig +short yourdomain.com
+# or
+nslookup yourdomain.com
+```
+
+The command should return your Elastic IP once propagation is complete. Do not continue to the next step until it does — Certbot's domain validation (Part 11.3) will fail otherwise.
+
+### 11.2 — Update the Nginx Server Block for Your Domain
+
+Edit the server block created in [Part 10](#part-10--configure-nginx-as-a-reverse-proxy) and replace the IP-based `server_name` with your domain(s):
+
+```bash
+sudo nano /etc/nginx/sites-available/badminton-vault
+```
+
+```nginx
+server_name yourdomain.com www.yourdomain.com;
+```
+
+Test and reload Nginx:
+
+```bash
+sudo nginx -t
+sudo systemctl restart nginx
+```
+
+Confirm the app is reachable at `http://yourdomain.com` before moving on.
+
+### 11.3 — Install Certbot
 
 ```bash
 sudo apt install -y certbot python3-certbot-nginx
 ```
 
-### 11.3 — Obtain the Certificate
+### 11.4 — Obtain the Certificate
 
 ```bash
-sudo certbot --nginx -d yourdomain.com
+sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
 ```
 
-Follow the prompts. Certbot will automatically edit your Nginx config to enable HTTPS and redirect HTTP to HTTPS.
+(Omit `-d www.yourdomain.com` if you did not set up the `www` DNS record.) Follow the prompts. Certbot will automatically edit your Nginx config to enable HTTPS and redirect HTTP to HTTPS.
 
-### 11.4 — Auto-Renewal
+### 11.5 — Auto-Renewal
 
 Certbot installs a systemd timer that renews the certificate automatically. Verify it:
 
@@ -592,9 +634,7 @@ Certbot installs a systemd timer that renews the certificate automatically. Veri
 sudo systemctl status certbot.timer
 ```
 
-### 11.5 — Update the Nginx Config
-
-After certbot runs, update the `server_name` in `/etc/nginx/sites-available/badminton-vault` from the IP address to your domain name, then restart Nginx.
+Your site is now available at `https://yourdomain.com`.
 
 ---
 
@@ -1016,6 +1056,8 @@ Understanding AWS pricing helps you estimate and manage costs.
 | GitHub Actions deploy step is skipped | Smoke tests failed in the `test` job | Fix the failing tests first; check the Actions log for which test failed |
 | Large video uploads time out | Nginx `proxy_read_timeout` too short | Already set to `300s` in the Nginx config in [Part 10](#part-10--configure-nginx-as-a-reverse-proxy); increase further if needed |
 | Video playback fails after deploy | Presigned URL expiry or S3 region mismatch | Verify `AWS_REGION` in `.env` matches the bucket's actual region |
+| Domain doesn't load the app | DNS not propagated yet, or A record missing/incorrect | Run `dig +short yourdomain.com` and confirm it returns your Elastic IP; wait for propagation before retrying |
+| Certbot fails with "DNS problem: NXDOMAIN" or similar | Domain's A record isn't pointing at the instance yet | Re-check the A record in your registrar's DNS settings (see [Part 11.1](#part-11--custom-domain-setup-and-https-with-lets-encrypt-recommended)) and wait for propagation before re-running `certbot` |
 
 ### Getting Help
 
