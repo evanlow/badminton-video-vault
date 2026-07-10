@@ -553,9 +553,9 @@ Navigate to `http://YOUR_ELASTIC_IP` in a browser. You should see the login page
 
 ## Part 11 — Custom Domain Setup and HTTPS with Let's Encrypt (Recommended)
 
-HTTPS is strongly recommended before using the app with real data, and using a domain name (instead of a bare IP address) makes the app easier to remember and share. This part covers pointing a domain you already own at your EC2 instance and then enabling HTTPS with a free Let's Encrypt certificate.
+HTTPS is strongly recommended before using the app with real data. Using a domain name (instead of a bare IP address) also makes the app easier to remember and share. This part covers pointing a domain you already own at your EC2 instance and then enabling HTTPS with a free Let's Encrypt certificate.
 
-If you do not have a domain yet, you can register one through a domain registrar (e.g. [Namecheap](https://www.namecheap.com/), [Squarespace Domains](https://www.squarespace.com/domains), [GoDaddy](https://www.godaddy.com/), or [Amazon Route 53](https://aws.amazon.com/route53/)), or you can skip this part for now and revisit it later — the app will still work over `http://YOUR_ELASTIC_IP`.
+If you do not have a domain yet, you can register one through a domain registrar (e.g. [Namecheap](https://www.namecheap.com/), [Squarespace Domains](https://www.squarespace.com/domains), [GoDaddy](https://www.godaddy.com/), or [Amazon Route 53](https://aws.amazon.com/route53/)). Alternatively, you can skip this part for now and revisit it later — the app will still work over `http://YOUR_ELASTIC_IP`.
 
 ### 11.1 — Point Your Domain at the Elastic IP
 
@@ -624,7 +624,7 @@ sudo apt install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
 ```
 
-(Omit `-d www.yourdomain.com` if you did not set up the `www` DNS record.) Follow the prompts. Certbot will automatically edit your Nginx config to enable HTTPS and redirect HTTP to HTTPS.
+(Omit `-d www.yourdomain.com` if you did not set up the `www` DNS record.) Follow the prompts. Certbot automatically edits your Nginx config to enable HTTPS and redirect HTTP to HTTPS.
 
 ### 11.5 — Auto-Renewal
 
