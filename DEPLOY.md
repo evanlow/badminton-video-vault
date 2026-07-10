@@ -603,7 +603,7 @@ sudo nano /etc/nginx/sites-available/badminton-vault
 server_name yourdomain.com www.yourdomain.com;
 ```
 
-Test and reload Nginx:
+Test and restart Nginx:
 
 ```bash
 sudo nginx -t
@@ -634,7 +634,7 @@ Certbot installs a systemd timer that renews the certificate automatically. Veri
 sudo systemctl status certbot.timer
 ```
 
-Your site is now available at `https://yourdomain.com`.
+Your site is now available at `https://yourdomain.com` and, if configured, `https://www.yourdomain.com`.
 
 ---
 
