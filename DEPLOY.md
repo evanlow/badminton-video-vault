@@ -156,7 +156,12 @@ IAM (Identity and Access Management) controls who can access your AWS resources.
             "Action": [
                 "s3:PutObject",
                 "s3:GetObject",
-                "s3:DeleteObject"
+                "s3:DeleteObject",
+                "s3:CreateMultipartUpload",
+                "s3:UploadPart",
+                "s3:CompleteMultipartUpload",
+                "s3:AbortMultipartUpload",
+                "s3:ListMultipartUploadParts"
             ],
             "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/*"
         }
@@ -169,7 +174,7 @@ IAM (Identity and Access Management) controls who can access your AWS resources.
 6. Name the policy (e.g., `BadmintonVideoVaultS3Policy`) and add an optional description.
 7. Click **Create policy**.
 
-> **Important:** This policy follows the principle of least privilege — the application can only put, get, and delete objects within the specific bucket. It cannot list buckets, modify bucket settings, or access other AWS services.
+> **Important:** This policy follows the principle of least privilege — the application can only put, get, and delete objects within the specific bucket. It cannot list buckets, modify bucket settings, or access other AWS services. The multipart upload actions are required because the application uses `boto3`'s `upload_fileobj`, which automatically uses multipart uploads for larger files.
 
 ### Step 2: Create an IAM User
 
@@ -413,7 +418,7 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 
 ### 8.5 — Initialise the Database
 
-**Run these commands only once on first deploy.** Running `init-db` again on an existing installation will drop and recreate all tables, erasing all data.
+**Run these commands only once on first deploy.** `flask init-db` calls `db.create_all()`, which creates tables that do not already exist — it is safe to run again on an existing installation (existing tables and data are left untouched), but there is no need to do so after the first deploy.
 
 ```bash
 cd /srv/badminton-video-vault
@@ -736,7 +741,7 @@ GitHub Actions spins up a fresh runner
      Workflow passes. New version is live.
 ```
 
-> **First deploy only:** `flask init-db` and `flask create-admin` are one-time setup steps you ran manually in Part 8. The GitHub Actions deploy script intentionally does **not** run them — doing so would drop and recreate all tables on every deploy, erasing your data.
+> **First deploy only:** `flask init-db` and `flask create-admin` are one-time setup steps you ran manually in Part 8. The GitHub Actions deploy script intentionally does **not** run them — they are interactive setup commands that only need to run once and are not part of the routine deployment process.
 
 ---
 
@@ -746,14 +751,14 @@ Locally the application uses SQLite (a single file: `badminton_vault.db`). The d
 
 ### Option A — SQLite on an EBS-backed EC2 Instance (simplest, used by this guide)
 
-If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite works perfectly in production as long as the database file lives on an **EBS (Elastic Block Store)** volume, which persists across instance reboots and is independent of the root volume.
+If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite works perfectly in production. The EC2 root volume is already EBS-backed, which means it persists across instance reboots — no separate volume is required for durability. A separate EBS volume is optional and only needed if you want to manage the database volume independently (e.g., snapshot it separately, resize it, or reattach it to a different instance).
 
 - **When to use:** Personal or small-team vault; single server; no auto-scaling needed.
 - **Cost:** No extra database cost beyond the EC2 instance itself.
-- **How to configure:** Mount the EBS volume and point `DATABASE_URL` at the file path:
+- **How to configure:** Point `DATABASE_URL` at the file path used by the guide:
 
   ```ini
-  DATABASE_URL=sqlite:////data/badminton_vault.db
+  DATABASE_URL=sqlite:////srv/badminton-video-vault/data/badminton_vault.db
   ```
 
   (Four slashes = absolute path on Unix.)
@@ -821,7 +826,7 @@ After configuring everything, verify the integration works end-to-end.
 Run the following Python snippet (from the EC2 instance or locally with the same `.env`) to confirm your credentials and bucket are working:
 
 ```bash
-python -c "
+python3 -c "
 import boto3
 from dotenv import load_dotenv
 import os
