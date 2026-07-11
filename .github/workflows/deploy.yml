@@ -1,6 +1,9 @@
 name: Test and Deploy
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -31,6 +34,7 @@ jobs:
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: test          # blocked until all smoke tests pass
 
     steps:
@@ -55,6 +59,22 @@ jobs:
             # Restart the application service
             sudo systemctl restart badminton-vault
 
-            # Confirm the service came back up
-            sleep 3
-            sudo systemctl is-active --quiet badminton-vault && echo "Service is running." || (echo "Service failed to start!" && exit 1)
+            # Confirm the app responds over its Unix socket directly (bypasses
+            # Nginx's server_name/Host routing so the check is deterministic
+            # even before Certbot/HTTPS is configured), retrying briefly to
+            # give Gunicorn time to bind.
+            for attempt in {1..10}; do
+              if curl --fail --silent --show-error --max-time 10 \
+                  --unix-socket /run/badminton-vault.sock \
+                  http://localhost/login > /dev/null; then
+                echo "Application responded successfully (attempt $attempt)."
+                exit 0
+              fi
+              echo "Attempt $attempt: application not ready yet, retrying..."
+              sleep 2
+            done
+
+            echo "Application did not respond over its Unix socket!"
+            sudo systemctl status badminton-vault --no-pager || true
+            sudo journalctl -u badminton-vault -n 100 --no-pager || true
+            exit 1
