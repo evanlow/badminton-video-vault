@@ -379,9 +379,8 @@ Badminton Video Vault is typically kept in a **private** GitHub repository, so c
    EOF
    chmod 600 ~/.ssh/config
 
-   cd /srv
-   git clone git@github.com:YOUR_GITHUB_USERNAME/badminton-video-vault.git
-   cd badminton-video-vault
+   git clone git@github.com:YOUR_GITHUB_USERNAME/badminton-video-vault.git /srv/badminton-video-vault
+   cd /srv/badminton-video-vault
    ```
 
 Replace `YOUR_GITHUB_USERNAME` with your GitHub username. A deploy key is scoped to a single repository and read-only, so it is safer to leave on the server long-term than a personal access token or your own SSH key.
