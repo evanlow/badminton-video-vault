@@ -842,8 +842,8 @@ jobs:
             done
 
             echo "Application did not respond over its Unix socket!"
-            sudo systemctl status badminton-vault --no-pager
-            sudo journalctl -u badminton-vault -n 100 --no-pager
+            sudo systemctl status badminton-vault --no-pager || true
+            sudo journalctl -u badminton-vault -n 100 --no-pager || true
             exit 1
 ```
 
