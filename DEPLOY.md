@@ -933,13 +933,49 @@ If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite 
 
 - **Backups and durability:** The EBS root volume persists across reboots, but it is still a single point of failure. Protect the database with one or both of:
   - **EBS snapshots** — in the EC2 console, go to **Elastic Block Store → Snapshots → Create snapshot** of the root volume, or automate this with **AWS Backup** / **Data Lifecycle Manager** on a schedule (e.g., daily).
-  - **Scheduled database file backups** — use SQLite's own backup command (safe to run against a live database, unlike a plain `cp`, which can copy a file mid-transaction and produce a corrupt backup) and upload the result off-instance, e.g. to a dedicated S3 backup prefix, so the backup survives loss of the instance or its EBS volume. Add a retention/cleanup job separately if you want to prune old local copies once uploaded:
+  - **Scheduled database file backups** — use SQLite's own backup command (safe to run against a live database, unlike a plain `cp`, which can copy a file mid-transaction and produce a corrupt backup) and upload the result off-instance, e.g. to a dedicated S3 backup prefix, so the backup survives loss of the instance or its EBS volume. A small script keeps the logic (and error handling) easier to read and maintain than a long inline cron command:
+
     ```bash
-    # Example cron entry (crontab -e) -- daily at 02:00
-    # mkdir -p re-creates the backup directory if it's ever missing (e.g. on
-    # a replacement instance); "%" is special in crontab and escaped as "\%".
-    0 2 * * * mkdir -p /srv/badminton-video-vault/data/backups && BACKUP_FILE=/srv/badminton-video-vault/data/backups/badminton_vault-$(date +\%Y\%m\%d\%H\%M).db; sqlite3 /srv/badminton-video-vault/data/badminton_vault.db ".backup '$BACKUP_FILE'" && aws s3 cp "$BACKUP_FILE" s3://your-backup-bucket/badminton-vault/ || echo "Backup failed at $(date)" >> /var/log/badminton-vault/backup-errors.log
+    sudo mkdir -p /srv/badminton-video-vault/scripts
+    sudo nano /srv/badminton-video-vault/scripts/backup-db.sh
     ```
+
+    ```bash
+    #!/bin/bash
+    # Backs up the SQLite database and uploads it to S3. Replace the bucket
+    # name below with your own backup bucket before enabling the cron job.
+    set -euo pipefail
+
+    DATA_DIR=/srv/badminton-video-vault/data
+    BACKUP_DIR="$DATA_DIR/backups"
+    LOG_FILE="$DATA_DIR/backup-errors.log"
+    S3_BUCKET=s3://your-backup-bucket/badminton-vault/
+    BACKUP_FILE="$BACKUP_DIR/badminton_vault-$(date +%Y%m%d%H%M).db"
+
+    mkdir -p "$BACKUP_DIR"
+
+    if ! sqlite3 "$DATA_DIR/badminton_vault.db" ".backup '$BACKUP_FILE'"; then
+      echo "$(date): sqlite3 backup failed" >> "$LOG_FILE"
+      exit 1
+    fi
+
+    if ! aws s3 cp "$BACKUP_FILE" "$S3_BUCKET"; then
+      echo "$(date): upload to $S3_BUCKET failed" >> "$LOG_FILE"
+      exit 1
+    fi
+    ```
+
+    ```bash
+    sudo chmod +x /srv/badminton-video-vault/scripts/backup-db.sh
+    ```
+
+    Add it to the crontab of the user that owns `/srv/badminton-video-vault` (`crontab -e`) to run daily at 02:00:
+
+    ```bash
+    0 2 * * * /srv/badminton-video-vault/scripts/backup-db.sh
+    ```
+
+    Add a separate retention/cleanup step if you want to prune old local copies once they've been uploaded.
   - Enable **EBS encryption** on the root volume (see [Part 6.4](#64--configure-storage)) so the database is encrypted at rest.
 
 ### Option B — Amazon RDS (recommended for multi-instance or managed deployments)
