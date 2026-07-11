@@ -939,7 +939,7 @@ If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite 
 
     # Example cron entry (crontab -e) -- daily at 02:00
     # Note: "%" is special in crontab and must be escaped as "\%".
-    0 2 * * * sqlite3 /srv/badminton-video-vault/data/badminton_vault.db ".backup '/srv/badminton-video-vault/data/backups/badminton_vault-$(date +\%Y\%m\%d).db'" && aws s3 cp /srv/badminton-video-vault/data/backups/badminton_vault-$(date +\%Y\%m\%d).db s3://your-backup-bucket/badminton-vault/
+    0 2 * * * BACKUP_FILE=/srv/badminton-video-vault/data/backups/badminton_vault-$(date +\%Y\%m\%d).db; sqlite3 /srv/badminton-video-vault/data/badminton_vault.db ".backup '$BACKUP_FILE'" && aws s3 cp "$BACKUP_FILE" s3://your-backup-bucket/badminton-vault/
     ```
   - Enable **EBS encryption** on the root volume (see [Part 6.4](#64--configure-storage)) so the database is encrypted at rest.
 
