@@ -334,8 +334,10 @@ sudo apt update && sudo apt upgrade -y
 ### 7.3 — Install System Dependencies
 
 ```bash
-sudo apt install -y python3 python3-pip python3-venv git nginx
+sudo apt install -y python3 python3-pip python3-venv git nginx sqlite3 awscli
 ```
+
+`sqlite3` and `awscli` are not required to run the application itself, but they are needed later for the scheduled database backup script (see [Database Options for Production](#database-options-for-production)).
 
 Verify Python is 3.10 or later:
 
@@ -933,7 +935,7 @@ If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite 
 
 - **Backups and durability:** The EBS root volume persists across reboots, but it is still a single point of failure. Protect the database with one or both of:
   - **EBS snapshots** — in the EC2 console, go to **Elastic Block Store → Snapshots → Create snapshot** of the root volume, or automate this with **AWS Backup** / **Data Lifecycle Manager** on a schedule (e.g., daily).
-  - **Scheduled database file backups** — use SQLite's own backup command (safe to run against a live database, unlike a plain `cp`, which can copy a file mid-transaction and produce a corrupt backup) and upload the result off-instance, e.g. to a dedicated S3 backup prefix, so the backup survives loss of the instance or its EBS volume. A small script keeps the logic (and error handling) easier to read and maintain than a long inline cron command:
+  - **Scheduled database file backups** — use SQLite's own backup command (safe to run against a live database, unlike a plain `cp`, which can copy a file mid-transaction and produce a corrupt backup) and upload the result off-instance, e.g. to a `backups/` prefix inside your existing application bucket, so the backup survives loss of the instance or its EBS volume. Using a prefix in the same bucket means the IAM policy from [Part 3](#part-3--set-up-iam-user-and-permissions) already grants the permissions needed — no separate bucket or extra IAM permissions to manage. A small script keeps the logic (and error handling) easier to read and maintain than a long inline cron command. This script requires `sqlite3` and `awscli` (installed in [Part 7.3](#73--install-system-dependencies)):
 
     ```bash
     sudo mkdir -p /srv/badminton-video-vault/scripts
@@ -942,14 +944,15 @@ If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite 
 
     ```bash
     #!/bin/bash
-    # Backs up the SQLite database and uploads it to S3. Replace the bucket
-    # name below with your own backup bucket before enabling the cron job.
+    # Backs up the SQLite database and uploads it to a backups/ prefix inside
+    # the application's own S3 bucket. Replace the bucket name below with
+    # your S3_BUCKET_NAME (Part 2) before enabling the cron job.
     set -euo pipefail
 
     DATA_DIR=/srv/badminton-video-vault/data
     BACKUP_DIR="$DATA_DIR/backups"
     LOG_FILE="$DATA_DIR/backup-errors.log"
-    S3_BUCKET=s3://your-backup-bucket/badminton-vault/
+    S3_BUCKET=s3://your-bucket-name/backups/
     BACKUP_FILE="$BACKUP_DIR/badminton_vault-$(date +%Y%m%d%H%M).db"
 
     mkdir -p "$BACKUP_DIR"
@@ -968,6 +971,8 @@ If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite 
     ```bash
     sudo chmod +x /srv/badminton-video-vault/scripts/backup-db.sh
     ```
+
+    > **AWS credentials for cron:** The `aws s3 cp` step above only picks up credentials automatically when an **EC2 instance IAM role** is attached (see [Part 6.1a](#61a--attach-an-iam-role-instead-of-access-keys-recommended)) — cron jobs do not inherit the `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` values from the application's `.env` file. If you are using static access keys instead of an instance role, configure the AWS CLI separately for the user that runs the cron job, e.g. `aws configure` (or a `~/.aws/credentials` file) using the same credentials, before enabling this cron job.
 
     Add it to the crontab of the user that owns `/srv/badminton-video-vault` (`crontab -e`) to run daily at 02:00:
 
