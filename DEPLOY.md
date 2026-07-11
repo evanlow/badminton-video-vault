@@ -436,10 +436,12 @@ S3_BUCKET_NAME=your-bucket-name
 PRESIGNED_URL_EXPIRY=3600
 
 # Mailgun (required for password reset and magic login emails)
-MAILGUN_API_KEY=your-mailgun-private-api-key
+# Use a Mailgun Domain Sending Key where possible (more limited scope than a
+# full private API key), as recommended in .env.example.
+MAILGUN_API_KEY=your-mailgun-domain-sending-key
 MAILGUN_DOMAIN=mg.yourdomain.com
 MAILGUN_API_BASE_URL=https://api.mailgun.net
-MAIL_FROM=Badminton Video Vault <noreply@mg.yourdomain.com>
+MAIL_FROM="Badminton Video Vault <noreply@mg.yourdomain.com>"
 MAIL_SUPPRESS_SEND=false
 MAILGUN_TEST_MODE=false
 MAILGUN_TIMEOUT_SECONDS=10
@@ -470,10 +472,10 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 | `AWS_REGION` | The AWS region where your bucket is located | `us-east-1`, `ap-southeast-1`, `eu-west-1` |
 | `S3_BUCKET_NAME` | The exact name of your S3 bucket | `badminton-video-vault-yourname` |
 | `PRESIGNED_URL_EXPIRY` | How long presigned URLs remain valid (in seconds) | `3600` (1 hour) |
-| `MAILGUN_API_KEY` | Your Mailgun private API key | `key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
+| `MAILGUN_API_KEY` | Your Mailgun Domain Sending Key (preferred; scoped to sending mail from one domain) or private API key | `key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
 | `MAILGUN_DOMAIN` | The sending domain configured in Mailgun | `mg.yourdomain.com` |
 | `MAILGUN_API_BASE_URL` | Mailgun API base URL (use the EU endpoint if your Mailgun account is in the EU region) | `https://api.mailgun.net` or `https://api.eu.mailgun.net` |
-| `MAIL_FROM` | The "From" address used for password reset / magic login emails | `Badminton Video Vault <noreply@mg.yourdomain.com>` |
+| `MAIL_FROM` | The "From" address used for password reset / magic login emails (quote it since it contains a space) | `"Badminton Video Vault <noreply@mg.yourdomain.com>"` |
 | `MAIL_SUPPRESS_SEND` | Must be `false` in production, or no email is actually sent | `false` |
 | `MAILGUN_TEST_MODE` | Must be `false` in production; `true` only for local/manual testing against Mailgun's sandbox | `false` |
 | `MAILGUN_TIMEOUT_SECONDS` | HTTP timeout (seconds) for calls to the Mailgun API | `10` |
@@ -745,10 +747,10 @@ Your site is now available at `https://yourdomain.com` and, if configured, `http
 ## Part 12 — Continuous Deployment from GitHub
 
 This GitHub Actions workflow automatically:
-1. Runs the full regression suite — every `tests/smoke_*.py` file, discovered dynamically by `tests/run_all_smoke.py` — in an isolated environment.
-2. **Only if every discovered test passes**, SSHs into EC2 and deploys the new code.
+1. Runs the full regression suite — every `tests/smoke_*.py` file, discovered dynamically by `tests/run_all_smoke.py` — in an isolated environment, on every pull request and every push to `main`.
+2. **Only on a push to `main`, and only if every discovered test passes**, SSHs into EC2 and deploys the new code.
 
-A failed test blocks the deploy — satisfying the prime directive requirement that the regression suite must be 100% green before any release.
+A failed test blocks the deploy — satisfying the prime directive requirement that the regression suite must be 100% green before any release. Running the test job on pull requests also means reviewers see regression results before merging, rather than only after code lands on `main`.
 
 ### 12.1 — Create the GitHub Actions Workflow File
 
@@ -764,6 +766,9 @@ Create `.github/workflows/deploy.yml`:
 name: Test and Deploy
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -790,10 +795,11 @@ jobs:
       - name: Run regression suite
         run: python tests/run_all_smoke.py
 
-  # ── Job 2: Deploy to EC2 (only runs if test job passed) ────────────────────
+  # ── Job 2: Deploy to EC2 (only runs on push to main, after tests pass) ─────
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: test          # blocked until all smoke tests pass
 
     steps:
@@ -818,15 +824,24 @@ jobs:
             # Restart the application service
             sudo systemctl restart badminton-vault
 
-            # Confirm the service came back up
-            sleep 3
-            sudo systemctl is-active --quiet badminton-vault || (echo "Service failed to start!" && exit 1)
+            # Confirm the app responds over its Unix socket directly (bypasses
+            # Nginx's server_name/Host routing so the check is deterministic
+            # even before Certbot/HTTPS is configured), retrying briefly to
+            # give Gunicorn time to bind.
+            for attempt in {1..10}; do
+              if curl --fail --silent --show-error --max-time 10 \
+                  --unix-socket /run/badminton-vault.sock \
+                  http://localhost/login > /dev/null; then
+                echo "Application responded successfully."
+                exit 0
+              fi
+              sleep 2
+            done
 
-            # Confirm the app actually responds over HTTP (via Nginx), not
-            # just that the service is marked active
-            curl --fail --silent --show-error --max-time 10 http://127.0.0.1/login > /dev/null \
-              && echo "Application responded successfully." \
-              || (echo "Application did not respond over HTTP!" && exit 1)
+            echo "Application did not respond over its Unix socket!"
+            sudo systemctl status badminton-vault --no-pager
+            sudo journalctl -u badminton-vault -n 100 --no-pager
+            exit 1
 ```
 
 ### 12.2 — Add GitHub Secrets
@@ -917,10 +932,14 @@ If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite 
 
 - **Backups and durability:** The EBS root volume persists across reboots, but it is still a single point of failure. Protect the database with one or both of:
   - **EBS snapshots** — in the EC2 console, go to **Elastic Block Store → Snapshots → Create snapshot** of the root volume, or automate this with **AWS Backup** / **Data Lifecycle Manager** on a schedule (e.g., daily).
-  - **Scheduled database file backups** — e.g., a cron job that copies `/srv/badminton-video-vault/data/badminton_vault.db` to S3 or another location on a schedule:
+  - **Scheduled database file backups** — use SQLite's own backup command (safe to run against a live database, unlike a plain `cp`, which can copy a file mid-transaction and produce a corrupt backup) and upload the result off-instance, e.g. to a dedicated S3 backup prefix, so the backup survives loss of the instance or its EBS volume:
     ```bash
+    # Create the local backup directory once:
+    mkdir -p /srv/badminton-video-vault/data/backups
+
     # Example cron entry (crontab -e) -- daily at 02:00
-    0 2 * * * cp /srv/badminton-video-vault/data/badminton_vault.db /srv/badminton-video-vault/data/backups/badminton_vault-$(date +%Y%m%d).db
+    # Note: "%" is special in crontab and must be escaped as "\%".
+    0 2 * * * sqlite3 /srv/badminton-video-vault/data/badminton_vault.db ".backup '/srv/badminton-video-vault/data/backups/badminton_vault-$(date +\%Y\%m\%d).db'" && aws s3 cp /srv/badminton-video-vault/data/backups/badminton_vault-$(date +\%Y\%m\%d).db s3://your-backup-bucket/badminton-vault/
     ```
   - Enable **EBS encryption** on the root volume (see [Part 6.4](#64--configure-storage)) so the database is encrypted at rest.
 
