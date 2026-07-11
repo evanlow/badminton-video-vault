@@ -832,9 +832,10 @@ jobs:
               if curl --fail --silent --show-error --max-time 10 \
                   --unix-socket /run/badminton-vault.sock \
                   http://localhost/login > /dev/null; then
-                echo "Application responded successfully."
+                echo "Application responded successfully (attempt $attempt)."
                 exit 0
               fi
+              echo "Attempt $attempt: application not ready yet, retrying..."
               sleep 2
             done
 
@@ -932,14 +933,12 @@ If you deploy to a **single EC2 instance** as described in Parts 6–12, SQLite 
 
 - **Backups and durability:** The EBS root volume persists across reboots, but it is still a single point of failure. Protect the database with one or both of:
   - **EBS snapshots** — in the EC2 console, go to **Elastic Block Store → Snapshots → Create snapshot** of the root volume, or automate this with **AWS Backup** / **Data Lifecycle Manager** on a schedule (e.g., daily).
-  - **Scheduled database file backups** — use SQLite's own backup command (safe to run against a live database, unlike a plain `cp`, which can copy a file mid-transaction and produce a corrupt backup) and upload the result off-instance, e.g. to a dedicated S3 backup prefix, so the backup survives loss of the instance or its EBS volume:
+  - **Scheduled database file backups** — use SQLite's own backup command (safe to run against a live database, unlike a plain `cp`, which can copy a file mid-transaction and produce a corrupt backup) and upload the result off-instance, e.g. to a dedicated S3 backup prefix, so the backup survives loss of the instance or its EBS volume. Add a retention/cleanup job separately if you want to prune old local copies once uploaded:
     ```bash
-    # Create the local backup directory once:
-    mkdir -p /srv/badminton-video-vault/data/backups
-
     # Example cron entry (crontab -e) -- daily at 02:00
-    # Note: "%" is special in crontab and must be escaped as "\%".
-    0 2 * * * BACKUP_FILE=/srv/badminton-video-vault/data/backups/badminton_vault-$(date +\%Y\%m\%d).db; sqlite3 /srv/badminton-video-vault/data/badminton_vault.db ".backup '$BACKUP_FILE'" && aws s3 cp "$BACKUP_FILE" s3://your-backup-bucket/badminton-vault/
+    # mkdir -p re-creates the backup directory if it's ever missing (e.g. on
+    # a replacement instance); "%" is special in crontab and escaped as "\%".
+    0 2 * * * mkdir -p /srv/badminton-video-vault/data/backups && BACKUP_FILE=/srv/badminton-video-vault/data/backups/badminton_vault-$(date +\%Y\%m\%d\%H\%M).db; sqlite3 /srv/badminton-video-vault/data/badminton_vault.db ".backup '$BACKUP_FILE'" && aws s3 cp "$BACKUP_FILE" s3://your-backup-bucket/badminton-vault/ || echo "Backup failed at $(date)" >> /var/log/badminton-vault/backup-errors.log
     ```
   - Enable **EBS encryption** on the root volume (see [Part 6.4](#64--configure-storage)) so the database is encrypted at rest.
 
