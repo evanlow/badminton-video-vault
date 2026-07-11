@@ -57,4 +57,10 @@ jobs:
 
             # Confirm the service came back up
             sleep 3
-            sudo systemctl is-active --quiet badminton-vault && echo "Service is running." || (echo "Service failed to start!" && exit 1)
+            sudo systemctl is-active --quiet badminton-vault || (echo "Service failed to start!" && exit 1)
+
+            # Confirm the app actually responds over HTTP (via Nginx), not
+            # just that the service is marked active
+            curl --fail --silent --show-error --max-time 10 http://127.0.0.1/login > /dev/null \
+              && echo "Application responded successfully." \
+              || (echo "Application did not respond over HTTP!" && exit 1)
