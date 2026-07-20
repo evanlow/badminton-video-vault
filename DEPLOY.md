@@ -517,44 +517,454 @@ Browse to `http://YOUR_ELASTIC_IP`.
 
 ## 10. Domain and HTTPS
 
-Point an `A` record to the Elastic IP, for example `vault.example.com`.
+This section connects a human-readable domain to the application and then enables HTTPS:
 
-Verify:
+```text
+vault.example.com
+        |  DNS A record
+        v
+EC2 Elastic IP
+        |  ports 80 and 443
+        v
+Nginx -> Gunicorn -> Flask
 
-```bash
-dig +short vault.example.com
+Browser video PUT requests -------------------------> Private S3 bucket
 ```
 
-Replace `server_name _;` with:
+`vault.example.com` is only a placeholder. Replace it everywhere below with the exact hostname you control, such as `vault.mybadmintonclub.com`. Do not literally configure `example.com`.
+
+The domain setup spans three places:
+
+1. **Your DNS provider** points the hostname to the EC2 Elastic IP.
+2. **The EC2 server** configures Nginx and obtains a TLS certificate with Certbot.
+3. **The S3 bucket** permits direct browser uploads from the new HTTPS origin.
+
+### 10.1 Before you begin
+
+Confirm all of the following before changing DNS:
+
+- You own a domain and can edit its DNS records.
+- The application currently opens at `http://YOUR_ELASTIC_IP`.
+- The Elastic IP is associated with the correct EC2 instance.
+- The EC2 security group permits inbound HTTP on port 80 and HTTPS on port 443.
+- SSH on port 22 remains restricted to your public IP or another trusted source.
+- Port 5000 is not exposed publicly.
+
+From the EC2 server, verify the current HTTP deployment:
+
+```bash
+curl -i http://127.0.0.1/login
+curl -I http://YOUR_ELASTIC_IP/login
+```
+
+Fix the EC2, Gunicorn, or Nginx deployment before continuing if these checks fail.
+
+### 10.2 Choose the exact hostname
+
+A subdomain is usually the simplest option:
+
+```text
+vault.example.com
+```
+
+For a domain such as `mybadmintonclub.com`, that would be:
+
+```text
+vault.mybadmintonclub.com
+```
+
+Use one exact hostname throughout the initial setup. The hostname must not contain:
+
+- `http://` or `https://`
+- a path such as `/login`
+- a trailing slash
+- a port such as `:5000`
+
+For example, use this in DNS and Nginx:
+
+```text
+vault.mybadmintonclub.com
+```
+
+Do not use this as a hostname:
+
+```text
+https://vault.mybadmintonclub.com/login
+```
+
+Using the root or apex domain, such as `mybadmintonclub.com`, is possible. DNS providers normally represent it with `@` or an empty record name. A dedicated subdomain is less likely to interfere with an existing website or email configuration.
+
+### 10.3 Confirm the Elastic IP and security group
+
+In AWS:
+
+1. Open **EC2 → Network & Security → Elastic IP addresses**.
+2. Select the Elastic IP intended for this application.
+3. Confirm its associated instance is the badminton vault EC2 instance.
+4. Copy the IPv4 address. It will look similar to `203.0.113.10`.
+
+If it is not associated:
+
+1. Select the Elastic IP.
+2. Choose **Actions → Associate Elastic IP address**.
+3. Select the EC2 instance and its primary private IPv4 address.
+4. Choose **Associate**.
+
+Then open the instance's security group and confirm these inbound rules:
+
+| Type | Port | Source |
+|---|---:|---|
+| SSH | 22 | Your public IP `/32` |
+| HTTP | 80 | `0.0.0.0/0`, optionally `::/0` |
+| HTTPS | 443 | `0.0.0.0/0`, optionally `::/0` |
+
+Do not point DNS at the instance's private IPv4 address. Do not point DNS at a temporary public IPv4 address when an Elastic IP has been allocated.
+
+### 10.4 Create the DNS A record
+
+Sign in to the service that manages DNS for the domain. This may be Route 53, Cloudflare, Squarespace Domains, GoDaddy, Namecheap, or another provider.
+
+Create an IPv4 `A` record:
+
+| DNS field | Example value |
+|---|---|
+| Type | `A` |
+| Name or Host | `vault` |
+| Value, Address, or Points to | `YOUR_ELASTIC_IP` |
+| TTL | `300`, five minutes, or `Auto` |
+
+For example:
+
+```text
+Type:   A
+Name:   vault
+Value:  203.0.113.10
+TTL:    Auto
+```
+
+That record means:
+
+```text
+vault.example.com -> 203.0.113.10
+```
+
+For Amazon Route 53:
+
+1. Open **Route 53 → Hosted zones**.
+2. Select the hosted zone for the domain.
+3. Choose **Create record**.
+4. Set **Record name** to `vault`.
+5. Set **Record type** to `A`.
+6. Enter the Elastic IP under **Value**.
+7. Use **Simple routing**.
+8. Choose **Create records**.
+
+Important DNS rules:
+
+- Enter only the hostname portion requested by the provider. Some providers expect `vault`; others display or expect the full hostname.
+- Do not enter `https://vault.example.com` in an A record.
+- Do not include a path, slash, or port.
+- Do not create a `CNAME` record whose target is an IP address.
+- Do not add an `AAAA` record unless IPv6 has deliberately been configured for the instance, routing, security group, and Nginx.
+- If a DNS provider offers an HTTP proxy or CDN mode, use **DNS only** during initial certificate setup. Re-enable the proxy later only after the direct origin works correctly.
+- Avoid changing unrelated MX, TXT, DKIM, SPF, or other records used by email and existing services.
+
+### 10.5 Verify DNS resolution
+
+Do not continue to Certbot until the hostname resolves publicly to the exact Elastic IP.
+
+From Windows PowerShell:
+
+```powershell
+nslookup vault.example.com
+Resolve-DnsName vault.example.com -Type A
+```
+
+From macOS, Linux, or the EC2 instance:
+
+```bash
+dig +short A vault.example.com
+```
+
+If `dig` is unavailable on Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y dnsutils
+dig +short A vault.example.com
+```
+
+The result must be the Elastic IP, for example:
+
+```text
+203.0.113.10
+```
+
+If the result is blank or shows another address:
+
+1. Recheck the A record name and value.
+2. Confirm the domain is using the nameservers of the DNS provider you edited.
+3. Remove conflicting records for the same hostname.
+4. Allow existing DNS caches to expire according to the previous TTL.
+5. Repeat the lookup until it returns the Elastic IP.
+
+Stop here while DNS is incorrect. Certbot cannot validate a hostname that does not reach this server.
+
+### 10.6 Configure Nginx for the hostname
+
+Connect to EC2 over SSH if not already connected:
+
+```bash
+ssh -i ~/.ssh/badminton-vault-key.pem ubuntu@YOUR_ELASTIC_IP
+```
+
+Windows PowerShell example:
+
+```powershell
+ssh -i "$HOME\.ssh\badminton-vault-key.pem" ubuntu@YOUR_ELASTIC_IP
+```
+
+Back up the working Nginx configuration:
+
+```bash
+sudo cp \
+  /etc/nginx/sites-available/badminton-vault \
+  /etc/nginx/sites-available/badminton-vault.before-domain
+```
+
+Open the configuration:
+
+```bash
+sudo nano /etc/nginx/sites-available/badminton-vault
+```
+
+Find:
+
+```nginx
+server_name _;
+```
+
+Replace it with the exact hostname:
 
 ```nginx
 server_name vault.example.com;
 ```
 
-Then:
+The `server_name` value contains only the hostname. Do not include `https://`, a path, or a trailing slash.
+
+Save the file, test it, and reload Nginx:
 
 ```bash
 sudo nginx -t
 sudo systemctl reload nginx
+sudo systemctl status nginx --no-pager -l
+```
+
+Do not reload Nginx if `sudo nginx -t` reports an error. Correct the indicated file and line first. To restore the backup if necessary:
+
+```bash
+sudo cp \
+  /etc/nginx/sites-available/badminton-vault.before-domain \
+  /etc/nginx/sites-available/badminton-vault
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### 10.7 Test the domain over HTTP
+
+Test the public hostname before requesting a certificate:
+
+```bash
+curl -I http://vault.example.com/login
+```
+
+Also open this address in a browser:
+
+```text
+http://vault.example.com/login
+```
+
+The login page should be the same application previously reached through the Elastic IP. If the Elastic IP works but the domain does not, recheck DNS, the EC2 security group, and `server_name` before continuing.
+
+### 10.8 Install Certbot and enable HTTPS
+
+Install Certbot and its Nginx integration on the EC2 server:
+
+```bash
 sudo apt update
 sudo apt install -y certbot python3-certbot-nginx
+```
+
+Request a certificate for the exact hostname:
+
+```bash
 sudo certbot --nginx -d vault.example.com
+```
+
+During the prompts:
+
+1. Enter an email address used for renewal and security notices.
+2. Accept the terms of service.
+3. Choose the option that redirects HTTP traffic to HTTPS when offered.
+
+Certbot should obtain the certificate and update the Nginx configuration. Then verify Nginx and the certificate:
+
+```bash
+sudo nginx -t
+sudo systemctl status nginx --no-pager -l
+sudo certbot certificates
+curl -I https://vault.example.com/login
+```
+
+Test automatic renewal without changing the live certificate:
+
+```bash
 sudo certbot renew --dry-run
 ```
 
-Update `.env`:
+The normal HTTP validation must reach this EC2 instance on port 80. If Certbot reports an authorisation or connection error, do not repeatedly retry without first checking the DNS result, Elastic IP association, port 80 security-group rule, Nginx status, and any DNS-provider proxy mode.
+
+### 10.9 Update the application base URL
+
+Open the production environment file:
+
+```bash
+nano /srv/badminton-video-vault/.env
+```
+
+Find the temporary HTTP value:
+
+```ini
+APP_BASE_URL=http://YOUR_ELASTIC_IP
+```
+
+Replace it with the exact HTTPS origin, with no trailing slash:
 
 ```ini
 APP_BASE_URL=https://vault.example.com
 ```
 
-Restart:
+Save the file and restart the application so Gunicorn loads the new environment value:
 
 ```bash
 sudo systemctl restart badminton-vault
+sleep 3
+sudo systemctl status badminton-vault --no-pager -l
 ```
 
-Finally, replace or extend the S3 CORS origin with the exact HTTPS origin.
+Confirm the configured value without printing unrelated secrets:
+
+```bash
+grep '^APP_BASE_URL=' /srv/badminton-video-vault/.env
+```
+
+### 10.10 Update the S3 CORS origin
+
+The browser uploads video parts directly to S3, so the S3 bucket must allow the new HTTPS origin.
+
+Open **S3 → bucket → Permissions → Cross-origin resource sharing (CORS)**.
+
+During migration, both the temporary IP address and the new domain may be listed:
+
+```json
+[
+  {
+    "AllowedHeaders": ["*"],
+    "AllowedMethods": ["GET", "PUT"],
+    "AllowedOrigins": [
+      "http://YOUR_ELASTIC_IP",
+      "https://vault.example.com"
+    ],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+After HTTPS uploads have been tested successfully, remove the temporary HTTP origin:
+
+```json
+[
+  {
+    "AllowedHeaders": ["*"],
+    "AllowedMethods": ["GET", "PUT"],
+    "AllowedOrigins": ["https://vault.example.com"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+The origin must match the browser address exactly:
+
+```text
+https://vault.example.com
+```
+
+Do not add a trailing slash. Do not use `"*"` for `AllowedOrigins` on the private production vault. Updating CORS does not make the bucket public; S3 objects remain protected by Block Public Access and temporary presigned URLs.
+
+### 10.11 Perform the final domain test
+
+Verify the HTTP-to-HTTPS redirect:
+
+```bash
+curl -I http://vault.example.com/login
+```
+
+The response should redirect to an `https://vault.example.com/...` location.
+
+Verify HTTPS directly:
+
+```bash
+curl -I https://vault.example.com/login
+```
+
+Then use a browser to complete the application test:
+
+1. Open `https://vault.example.com`.
+2. Confirm the browser reports a valid secure connection.
+3. Sign in.
+4. Upload a small MP4 before testing a large file.
+5. In browser developer tools, open **Network**.
+6. Confirm application JSON requests use the HTTPS domain.
+7. Confirm multipart `PUT` requests go directly to an S3 hostname.
+8. Confirm the video record is created and playback works.
+
+After the domain works, use the hostname instead of the Elastic IP for normal access.
+
+### 10.12 Domain and HTTPS troubleshooting
+
+| Symptom | Checks and fixes |
+|---|---|
+| DNS lookup is blank | Check the record name, active nameservers, and DNS-zone selection; then wait for the previous TTL to expire |
+| DNS lookup returns the wrong IP | Replace the record value with the associated Elastic IP and remove conflicting A records |
+| Domain times out | Confirm the Elastic IP association, inbound ports 80/443, Nginx status, and any active host firewall |
+| Certbot reports `unauthorized` | Confirm the A record resolves to this EC2 instance, port 80 is reachable, Nginx is running, and proxy/CDN mode is disabled during setup |
+| `sudo nginx -t` fails | Correct the reported syntax error or restore `badminton-vault.before-domain` before reloading |
+| HTTPS returns `502 Bad Gateway` | Check `badminton-vault` service status and the Unix socket under `/run/badminton-vault/` |
+| Browser shows the wrong certificate | Check DNS for old A/AAAA records, inspect `sudo certbot certificates`, and confirm the browser is reaching this server rather than a proxy |
+| Website works but uploads fail with CORS | Add the exact `https://vault.example.com` origin to S3 CORS, preserve `ETag`, and remove any trailing slash |
+| IPv4 works but some clients fail | Remove an unintended AAAA record or fully configure IPv6 through DNS, EC2 networking, the security group, and Nginx |
+
+Useful diagnostics:
+
+```bash
+dig +short A vault.example.com
+sudo nginx -t
+sudo systemctl status nginx --no-pager -l
+sudo systemctl status badminton-vault --no-pager -l
+sudo certbot certificates
+sudo tail -n 100 /var/log/nginx/error.log
+sudo tail -n 100 /var/log/badminton-vault/error.log
+sudo ufw status
+```
+
+If UFW is active and does not permit web traffic:
+
+```bash
+sudo ufw allow 'Nginx Full'
+sudo ufw status
+```
 
 ---
 
@@ -694,4 +1104,9 @@ aws sts get-caller-identity
 - [S3 CORS](https://docs.aws.amazon.com/AmazonS3/latest/userguide/cors.html)
 - [Abort incomplete multipart uploads with lifecycle](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpu-abort-incomplete-mpu-lifecycle-config.html)
 - [Attach an IAM role to EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/attach-iam-role.html)
+- [Elastic IP addresses](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html)
+- [Create records in Route 53](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-creating.html)
+- [Nginx server names](https://nginx.org/en/docs/http/server_names.html)
+- [Certbot instructions](https://certbot.eff.org/instructions)
+- [Let's Encrypt challenge types](https://letsencrypt.org/docs/challenge-types/)
 - [AWS CLI v2 installation](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
