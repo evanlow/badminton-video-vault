@@ -1,100 +1,69 @@
 # Deploying Badminton Video Vault to AWS
 
-This guide deploys Badminton Video Vault to one Ubuntu EC2 instance with:
+This guide deploys Badminton Video Vault to a single Ubuntu EC2 instance with:
 
 - Nginx on ports 80 and 443
 - Gunicorn behind a systemd-managed Unix socket
 - Flask and SQLite under `/srv/badminton-video-vault`
-- Amazon S3 for private video storage
+- A private Amazon S3 bucket for video objects
+- Direct browser-to-S3 multipart uploads
 - An EC2 IAM role for temporary AWS credentials
-- Optional GitHub Actions deployment after tests pass
+- Optional deployment from GitHub Actions after all smoke tests pass
 
-Follow the parts in order. Commands assume Ubuntu and the default `ubuntu` user.
+Follow the parts in order. Commands assume the default Ubuntu user, `ubuntu`.
 
-> **Capacity warning:** The current application receives each upload through Nginx and Gunicorn before sending it to S3. A 1 GiB `t2.micro` or `t3.micro` can run the vault for light use, but large uploads can exhaust memory unless Gunicorn is limited to one worker and swap is configured. For frequent uploads of several hundred megabytes or more, use an instance with at least 2 GiB RAM or redesign uploads to go directly from the browser to S3.
+> **Upload architecture:** Video bytes no longer pass through Nginx, Gunicorn, Flask, `/tmp`, or the EC2 root disk. Flask creates a multipart upload and returns temporary presigned part URLs. The browser uploads the parts directly to private S3. Flask then completes the multipart upload, verifies the final object size, and stores only metadata in SQLite.
 
 ---
 
 ## Table of Contents
 
-1. [Prerequisites](#prerequisites)
-2. [Architecture Overview](#architecture-overview)
-3. [Part 1 — Create an AWS Account](#part-1--create-an-aws-account)
-4. [Part 2 — Create and Configure an S3 Bucket](#part-2--create-and-configure-an-s3-bucket)
-5. [Part 3 — Create the S3 IAM Policy](#part-3--create-the-s3-iam-policy)
-6. [Part 4 — Create the EC2 IAM Role](#part-4--create-the-ec2-iam-role)
-7. [Part 5 — Configure CORS Only If Needed](#part-5--configure-cors-only-if-needed)
-8. [Part 6 — Launch or Prepare an EC2 Instance](#part-6--launch-or-prepare-an-ec2-instance)
-9. [Part 7 — Connect and Prepare Ubuntu](#part-7--connect-and-prepare-ubuntu)
-10. [Part 8 — Deploy the Application](#part-8--deploy-the-application)
-11. [Part 9 — Configure Gunicorn with systemd](#part-9--configure-gunicorn-with-systemd)
-12. [Part 10 — Configure Nginx](#part-10--configure-nginx)
-13. [Part 11 — Configure a Domain and HTTPS](#part-11--configure-a-domain-and-https)
-14. [Part 12 — Continuous Deployment from GitHub](#part-12--continuous-deployment-from-github)
-15. [Database and Backup Options](#database-and-backup-options)
-16. [Verify the Complete Setup](#verify-the-complete-setup)
-17. [Maintenance](#maintenance)
-18. [Security Best Practices](#security-best-practices)
-19. [Capacity and Cost Notes](#capacity-and-cost-notes)
-20. [Troubleshooting](#troubleshooting)
+1. [Architecture](#architecture)
+2. [Part 1 — Create the S3 Bucket](#part-1--create-the-s3-bucket)
+3. [Part 2 — Create the S3 IAM Policy](#part-2--create-the-s3-iam-policy)
+4. [Part 3 — Create and Attach the EC2 IAM Role](#part-3--create-and-attach-the-ec2-iam-role)
+5. [Part 4 — Configure Required S3 CORS and Lifecycle](#part-4--configure-required-s3-cors-and-lifecycle)
+6. [Part 5 — Launch or Prepare EC2](#part-5--launch-or-prepare-ec2)
+7. [Part 6 — Prepare Ubuntu](#part-6--prepare-ubuntu)
+8. [Part 7 — Clone and Configure the Application](#part-7--clone-and-configure-the-application)
+9. [Part 8 — Configure Gunicorn and systemd](#part-8--configure-gunicorn-and-systemd)
+10. [Part 9 — Configure Nginx](#part-9--configure-nginx)
+11. [Part 10 — Domain and HTTPS](#part-10--domain-and-https)
+12. [Part 11 — Deploy Updates](#part-11--deploy-updates)
+13. [Part 12 — Verify the Complete Setup](#part-12--verify-the-complete-setup)
+14. [Backups and Maintenance](#backups-and-maintenance)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
-## Prerequisites
-
-You need:
-
-- An AWS account
-- A GitHub repository containing this application
-- An S3 bucket name that is globally unique
-- Basic access to the AWS Management Console
-- A domain name only if you want HTTPS and a friendly URL
-- Mailgun HTTP API credentials only if password-reset and magic-login emails will be enabled
-
-The production server should run Python 3.10 or later.
-
----
-
-## Architecture Overview
+## Architecture
 
 ```text
 Browser
+   |-- small authenticated JSON requests --> Nginx --> Gunicorn --> Flask
    |
-   | HTTP/HTTPS
-   v
-Nginx :80/:443
-   |
-   | Unix socket
-   v
-Gunicorn
-   |
-   v
-Flask application
-   |                      |
-   | SQLite metadata      | boto3 using EC2 IAM role
-   v                      v
-EBS root volume          Private S3 bucket
+   `-- presigned multipart PUT requests --------------------------> Private S3
+
+Flask -- completes upload and verifies size --> S3
+Flask -- stores metadata --------------------> SQLite on EBS
 ```
 
-On a 1 GiB micro instance, this guide deliberately uses **one Gunicorn worker**. More worker processes consume more memory because each worker loads a separate Python application process.
+The default upload settings are:
 
-Video objects remain private in S3. Playback and downloads use time-limited presigned URLs.
+- Maximum video size: 2 GiB
+- Multipart part size: 16 MiB
+- Concurrent browser uploads: 3 parts
+- Automatic retry: up to 3 attempts per failed part
+- Part URL lifetime: 2 hours
+- Signed coordination-token lifetime: 6 hours
+
+For a 2 GiB video, the browser sends 128 parts directly to S3. EC2 handles only small JSON requests, so video size no longer determines EC2 RAM or temporary-disk requirements.
+
+The S3 bucket remains private. Upload, playback, and download access use temporary presigned URLs.
 
 ---
 
-## Part 1 — Create an AWS Account
-
-Create an AWS account from the AWS website and sign in to the AWS Management Console.
-
-Use an IAM administrator identity for setup instead of routinely using the root account. Enable MFA on the root account and on privileged IAM identities.
-
-AWS Free Tier eligibility, public IPv4 pricing, and instance eligibility change over time. Check the current AWS pricing and Free Tier pages before relying on a specific allowance.
-
----
-
-## Part 2 — Create and Configure an S3 Bucket
-
-### 2.1 — Create the bucket
+## Part 1 — Create the S3 Bucket
 
 In **Amazon S3 → General purpose buckets → Create bucket**, configure:
 
@@ -105,26 +74,20 @@ In **Amazon S3 → General purpose buckets → Create bucket**, configure:
 | Object Ownership | ACLs disabled |
 | Block Public Access | Block all public access |
 | Versioning | Optional |
-| Default encryption | SSE-S3, or SSE-KMS if you require KMS controls |
+| Default encryption | SSE-S3, or SSE-KMS when required |
 
-Record:
+Record the exact values:
 
 ```text
 S3_BUCKET_NAME
 AWS_REGION
 ```
 
-The exact bucket region must later match `AWS_REGION` in `.env`.
-
-### 2.2 — Optional lifecycle rule
-
-A useful lifecycle rule is to delete incomplete multipart uploads after seven days. This prevents abandoned multipart parts from accumulating storage charges.
+`AWS_REGION` in `.env` must match the bucket region.
 
 ---
 
-## Part 3 — Create the S3 IAM Policy
-
-Create one customer-managed IAM policy. The same policy can be attached to an EC2 role and, only when necessary, to a non-EC2 IAM user.
+## Part 2 — Create the S3 IAM Policy
 
 Go to **IAM → Policies → Create policy → JSON** and use:
 
@@ -154,62 +117,70 @@ Replace `YOUR-BUCKET-NAME`, then name the policy:
 BadmintonVideoVaultS3Policy
 ```
 
-This policy intentionally grants object access only within the selected bucket. It does not permit changing bucket settings or accessing other buckets.
+S3 authorizes multipart creation, part upload, and completion through `s3:PutObject`. `AbortMultipartUpload` permits cancellation and cleanup. `GetObject` also permits the post-completion `HeadObject` size verification used by the application.
 
 ---
 
-## Part 4 — Create the EC2 IAM Role
+## Part 3 — Create and Attach the EC2 IAM Role
 
-An EC2 IAM role is the recommended authentication method. It gives boto3 temporary, automatically rotated credentials and avoids storing AWS access keys on the server.
+### 3.1 — Create the role
 
-### 4.1 — Create the role
-
-1. Go to **IAM → Roles → Create role**.
-2. Trusted entity type: **AWS service**.
+1. Open **IAM → Roles → Create role**.
+2. Trusted entity: **AWS service**.
 3. Use case: **EC2**.
 4. Attach `BadmintonVideoVaultS3Policy`.
-5. Name the role:
+5. Name it:
 
    ```text
    BadmintonVideoVaultEC2Role
    ```
 
-### 4.2 — Attach it during launch
+### 3.2 — Attach during launch
 
-During EC2 launch, open **Advanced details → IAM instance profile** and select `BadmintonVideoVaultEC2Role`.
+In the EC2 launch screen, choose **Advanced details → IAM instance profile → BadmintonVideoVaultEC2Role**.
 
-### 4.3 — Attach it after the instance already exists
+### 3.3 — Attach to an existing instance
 
-You do not need to recreate an instance merely because the role was omitted at launch:
+You do not need to recreate an instance:
 
-1. Go to **EC2 → Instances**.
+1. Open **EC2 → Instances**.
 2. Select the instance.
 3. Choose **Actions → Security → Modify IAM role**.
 4. Select `BadmintonVideoVaultEC2Role`.
 5. Choose **Update IAM role**.
 
-An EC2 instance can have one instance role at a time, while that role can contain multiple policies.
-
-### 4.4 — Static access keys are fallback-only
-
-Create an IAM user and access key only when running the application outside EC2 and no workload role is available. Never commit access keys to GitHub.
-
-When the EC2 role is attached, do **not** put these variables in `.env`:
+With the role attached, do not place these variables in production `.env`:
 
 ```text
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY
 ```
 
+Boto3 and AWS CLI automatically use the instance role's temporary credentials.
+
 ---
 
-## Part 5 — Configure CORS Only If Needed
+## Part 4 — Configure Required S3 CORS and Lifecycle
 
-The current application uploads to S3 from the server, not directly from browser JavaScript. Start without an S3 CORS rule.
+### 4.1 — CORS is required for direct uploads
 
-Add CORS only when the browser developer console shows a genuine S3 cross-origin error during playback or when a future direct browser-to-S3 upload feature is introduced.
+Open **S3 → your bucket → Permissions → Cross-origin resource sharing (CORS) → Edit**.
 
-Example:
+For initial HTTP testing by Elastic IP:
+
+```json
+[
+  {
+    "AllowedHeaders": ["*"],
+    "AllowedMethods": ["GET", "PUT"],
+    "AllowedOrigins": ["http://YOUR_ELASTIC_IP"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+After HTTPS is working, replace the origin with the final site origin:
 
 ```json
 [
@@ -223,128 +194,97 @@ Example:
 ]
 ```
 
-Replace the origin with the exact production origin. Do not use `"*"` for a private production vault unless the design explicitly requires it.
+During migration, both exact origins may be listed:
+
+```json
+"AllowedOrigins": [
+  "http://YOUR_ELASTIC_IP",
+  "https://vault.example.com"
+]
+```
+
+Important details:
+
+- The origin has no trailing slash.
+- Include every real frontend origin separately, such as both apex and `www` when both are used.
+- Keep S3 Block Public Access enabled.
+- Do not use `"*"` for `AllowedOrigins` on a private production vault.
+- `ExposeHeaders` must include `ETag`; the browser needs each part's ETag to complete the upload.
+
+### 4.2 — Delete abandoned multipart uploads
+
+The browser asks Flask to abort a failed or cancelled upload, but a closed tab, dead battery, or network outage may prevent that request.
+
+Open **S3 → your bucket → Management → Create lifecycle rule** and add a rule that:
+
+```text
+Deletes incomplete multipart uploads after 7 days
+```
+
+This is the final cleanup layer for abandoned parts and avoids indefinite storage charges.
 
 ---
 
-## Part 6 — Launch or Prepare an EC2 Instance
+## Part 5 — Launch or Prepare EC2
 
-### 6.1 — AMI and instance type
+### 5.1 — AMI and instance type
 
-Recommended AMI:
-
-```text
-Ubuntu Server 22.04 LTS or Ubuntu Server 24.04 LTS
-64-bit x86
-```
-
-Instance guidance:
+Use Ubuntu Server 22.04 LTS or 24.04 LTS, 64-bit x86.
 
 | Workload | Suggested starting point |
 |---|---|
-| Light personal use and small uploads | `t2.micro` or `t3.micro`, one Gunicorn worker, 2 GiB swap |
-| Uploads of several hundred MB, or several users | At least 2 GiB RAM, such as `t3.small` |
-| Frequent large uploads | More RAM and direct browser-to-S3 multipart upload design |
+| Personal or small team | `t2.micro` or `t3.micro`, one Gunicorn worker |
+| More concurrent page/API traffic | At least 2 GiB RAM, such as `t3.small` |
+| Multiple application instances | Larger instance plus an external database such as RDS |
 
-A micro instance has roughly 1 GiB RAM. Three Gunicorn workers are not appropriate for this application on that memory size.
+Direct S3 upload means a 2 GiB video does not require 2 GiB of EC2 RAM or temporary disk. Instance size is driven by concurrent Flask requests and database work rather than video size.
 
-### 6.2 — Key pair
+### 5.2 — Root volume
 
-Create an RSA `.pem` key pair and store it securely. It cannot be downloaded again.
+Use a 20 GiB gp3 root volume as a comfortable starting point and enable EBS encryption.
 
-On Linux or macOS:
+The volume stores Ubuntu, the application, virtual environment, SQLite database, logs, and optional swap. It does not store uploaded video bodies.
 
-```bash
-chmod 400 ~/.ssh/badminton-vault-key.pem
-```
-
-On Windows, use the built-in OpenSSH client from PowerShell and keep the key under your user profile, for example:
-
-```powershell
-ssh -i "$HOME\.ssh\badminton-vault-key.pem" ubuntu@YOUR_ELASTIC_IP
-```
-
-### 6.3 — Security group
-
-Use these inbound rules:
+### 5.3 — Security group
 
 | Type | Port | Source | Purpose |
 |---|---:|---|---|
-| SSH | 22 | Your public IP `/32` | SSH from your computer |
-| HTTP | 80 | `0.0.0.0/0` and optionally `::/0` | Initial web access and certificate validation |
-| HTTPS | 443 | `0.0.0.0/0` and optionally `::/0` | Production web access |
+| SSH | 22 | Your public IP `/32` | Administration |
+| HTTP | 80 | `0.0.0.0/0`, optionally `::/0` | Initial site and certificate validation |
+| HTTPS | 443 | `0.0.0.0/0`, optionally `::/0` | Production site |
 
 Do not open port 5000.
 
-Avoid leaving SSH open to `0.0.0.0/0`. If you use browser-based **EC2 Instance Connect with a public IP**, allow port 22 from the AWS-managed prefix list named:
+Avoid leaving SSH open to `0.0.0.0/0`. For browser-based EC2 Instance Connect, use the AWS-managed EC2 Instance Connect prefix list for the instance region.
 
-```text
-com.amazonaws.YOUR-REGION.ec2-instance-connect
-```
+### 5.4 — Elastic IP
 
-For Singapore, the name is:
+Allocate and associate an Elastic IP so the address remains stable after stops and starts. Record it as `YOUR_ELASTIC_IP`.
 
-```text
-com.amazonaws.ap-southeast-1.ec2-instance-connect
-```
-
-GitHub-hosted Actions runners do not have one fixed source IP. Part 12 describes the security tradeoff before enabling SSH-based continuous deployment.
-
-### 6.4 — Storage
-
-Configure a **20 GiB gp3** root volume as a practical starting point and enable EBS encryption.
-
-The root volume stores:
-
-- Ubuntu and installed packages
-- The application and Python virtual environment
-- SQLite metadata
-- Temporary request data
-- Logs
-- The optional 2 GiB swap file
-
-Videos themselves are stored in S3.
-
-### 6.5 — Elastic IP
-
-Allocate and associate an Elastic IP so the server address remains stable after stops and starts. Record it as:
-
-```text
-YOUR_ELASTIC_IP
-```
-
-Public IPv4 addresses may be billed. Check current AWS pricing.
+Public IPv4 addresses may be billed; check current AWS pricing.
 
 ---
 
-## Part 7 — Connect and Prepare Ubuntu
+## Part 6 — Prepare Ubuntu
 
-### 7.1 — Connect
-
-From Linux, macOS, or Windows OpenSSH:
+### 6.1 — Connect
 
 ```bash
 ssh -i ~/.ssh/badminton-vault-key.pem ubuntu@YOUR_ELASTIC_IP
 ```
 
-The Ubuntu AMI username is `ubuntu`.
+On Windows PowerShell, a typical path is:
 
-You may instead use **EC2 → Instances → Connect → EC2 Instance Connect** after configuring the correct prefix-list rule described in Part 6.3.
+```powershell
+ssh -i "$HOME\.ssh\badminton-vault-key.pem" ubuntu@YOUR_ELASTIC_IP
+```
 
-### 7.2 — Refresh package metadata first
-
-Run:
+### 6.2 — Update first, then install packages
 
 ```bash
 sudo apt update
 sudo apt upgrade -y
-```
 
-`apt update` is essential. Running only `apt upgrade` does not refresh the package index.
-
-### 7.3 — Install operating-system packages
-
-```bash
 sudo apt install -y \
   python3 \
   python3-pip \
@@ -356,15 +296,7 @@ sudo apt install -y \
   unzip
 ```
 
-Verify:
-
-```bash
-python3 --version
-git --version
-nginx -v
-```
-
-If Ubuntu says `python3-pip` or `python3-venv` cannot be found:
+If `python3-pip` or `python3-venv` cannot be found:
 
 ```bash
 sudo apt install -y software-properties-common
@@ -373,60 +305,40 @@ sudo apt update
 sudo apt install -y python3-pip python3-venv
 ```
 
-### 7.4 — Install AWS CLI version 2
+Verify:
 
-Do not depend on the Ubuntu `awscli` package being available or current. Install the official bundled AWS CLI v2:
+```bash
+python3 --version
+git --version
+nginx -v
+```
+
+### 6.3 — Install AWS CLI v2
 
 ```bash
 ARCH="$(uname -m)"
-
 case "$ARCH" in
-  x86_64)
-    AWSCLI_ARCH="x86_64"
-    ;;
-  aarch64|arm64)
-    AWSCLI_ARCH="aarch64"
-    ;;
-  *)
-    echo "Unsupported architecture: $ARCH"
-    exit 1
-    ;;
+  x86_64) AWSCLI_ARCH="x86_64" ;;
+  aarch64|arm64) AWSCLI_ARCH="aarch64" ;;
+  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
 curl "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" \
   -o /tmp/awscliv2.zip
-
 rm -rf /tmp/aws
 unzip -q /tmp/awscliv2.zip -d /tmp
 sudo /tmp/aws/install
 rm -rf /tmp/aws /tmp/awscliv2.zip
 
 aws --version
-```
-
-Do not run `aws configure` when using the EC2 IAM role.
-
-Verify the attached role:
-
-```bash
 aws sts get-caller-identity
 ```
 
-The ARN should contain:
+Do not run `aws configure` when the EC2 role is attached. The returned ARN should contain `assumed-role/BadmintonVideoVaultEC2Role/`.
 
-```text
-assumed-role/BadmintonVideoVaultEC2Role/
-```
+### 6.4 — Optional swap on a 1 GiB instance
 
-### 7.5 — Add swap on a 1 GiB micro instance
-
-Check memory:
-
-```bash
-free -h
-```
-
-If the instance has about 1 GiB RAM and no swap, add a 2 GiB swap file:
+Direct uploads no longer require swap proportional to the video size. A small swap file can still provide emergency headroom:
 
 ```bash
 sudo fallocate -l 2G /swapfile
@@ -441,83 +353,47 @@ free -h
 swapon --show
 ```
 
-Swap protects against temporary memory spikes but is much slower than RAM. If the application regularly uses substantial swap, resize the EC2 instance.
+Frequent swap use under ordinary traffic means the instance should be resized.
 
-### 7.6 — Create the empty application directory
+### 6.5 — Create an empty application directory
 
 ```bash
 sudo mkdir -p /srv/badminton-video-vault
 sudo chown ubuntu:ubuntu /srv/badminton-video-vault
-```
-
-Do not create `data/` yet. The destination must be empty before `git clone`.
-
-Confirm:
-
-```bash
 ls -la /srv/badminton-video-vault
 ```
 
+Do not create `data/` before cloning. `git clone` requires the destination to be empty.
+
 ---
 
-## Part 8 — Deploy the Application
+## Part 7 — Clone and Configure the Application
 
-### 8.1 — Clone the repository
+### 7.1 — Clone
 
-For a **public** repository:
+For a public repository:
 
 ```bash
 git clone https://github.com/YOUR_GITHUB_USERNAME/badminton-video-vault.git \
   /srv/badminton-video-vault
+```
 
+For a private repository, create a read-only GitHub deploy key and clone over SSH.
+
+After cloning:
+
+```bash
 cd /srv/badminton-video-vault
 mkdir -p data
-```
-
-The repository must be cloned first; only then create `data/`.
-
-For a **private** repository, use a read-only deploy key:
-
-```bash
-ssh-keygen -t ed25519 \
-  -C "badminton-video-vault-deploy-key" \
-  -f ~/.ssh/deploy_key \
-  -N ""
-
-cat ~/.ssh/deploy_key.pub
-```
-
-Add the displayed public key under **GitHub repository → Settings → Deploy keys**, without write access. Then:
-
-```bash
-cat > ~/.ssh/config <<'EOF'
-Host github.com
-  IdentityFile ~/.ssh/deploy_key
-  IdentitiesOnly yes
-EOF
-
-chmod 600 ~/.ssh/config
-
-git clone git@github.com:YOUR_GITHUB_USERNAME/badminton-video-vault.git \
-  /srv/badminton-video-vault
-
-cd /srv/badminton-video-vault
-mkdir -p data
-```
-
-### 8.2 — Create the virtual environment
-
-```bash
-cd /srv/badminton-video-vault
 python3 -m venv venv
 source venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 8.3 — Create `.env`
+### 7.2 — Create `.env`
 
-Generate a Flask secret:
+Generate a secret:
 
 ```bash
 python3 -c "import secrets; print(secrets.token_hex(32))"
@@ -529,7 +405,7 @@ Create the file:
 nano /srv/badminton-video-vault/.env
 ```
 
-Initial configuration when using the EC2 role:
+Example for an EC2 IAM role:
 
 ```ini
 FLASK_SECRET_KEY=PASTE_A_LONG_RANDOM_VALUE
@@ -540,28 +416,35 @@ DATABASE_URL=sqlite:////srv/badminton-video-vault/data/badminton_vault.db
 
 AWS_REGION=ap-southeast-1
 S3_BUCKET_NAME=your-exact-bucket-name
+
+# Playback/download links
 PRESIGNED_URL_EXPIRY=3600
 
-# Initial HTTP testing. Change this after HTTPS is working.
+# Direct browser-to-S3 multipart uploads
+MAX_VIDEO_FILE_SIZE=2147483648
+MAX_REQUEST_BODY_SIZE=4194304
+S3_MULTIPART_PART_SIZE=16777216
+S3_MULTIPART_URL_EXPIRY=7200
+S3_MULTIPART_TOKEN_MAX_AGE=21600
+S3_MULTIPART_CONCURRENCY=3
+
+# Initial HTTP testing; change after HTTPS is working
 APP_BASE_URL=http://YOUR_ELASTIC_IP
 
-# Keep true until Mailgun is fully configured and tested.
+# Keep suppressed until Mailgun is configured
 MAIL_SUPPRESS_SEND=true
 MAILGUN_TEST_MODE=false
 MAILGUN_TIMEOUT_SECONDS=10
 ```
 
-When enabling Mailgun HTTP API delivery, also add:
+Configuration notes:
 
-```ini
-MAILGUN_API_KEY=your-mailgun-domain-sending-key
-MAILGUN_DOMAIN=notifications.example.com
-MAILGUN_API_BASE_URL=https://api.mailgun.net
-MAIL_FROM="Badminton Video Vault <noreply@notifications.example.com>"
-MAIL_SUPPRESS_SEND=false
-```
-
-Do not add AWS access-key variables when the instance role is attached.
+- `MAX_VIDEO_FILE_SIZE` controls the selectable video size, not Flask's request-body limit.
+- `MAX_REQUEST_BODY_SIZE` stays small because Flask receives JSON only.
+- S3 multipart parts must be at least 5 MiB except the final part; 16 MiB is a practical default.
+- Increase `S3_MULTIPART_URL_EXPIRY` when users have very slow upstream connections.
+- A signed upload token is bound to the authenticated user and expires after `S3_MULTIPART_TOKEN_MAX_AGE`.
+- Do not add AWS access-key variables when using the instance role.
 
 Protect the file:
 
@@ -569,25 +452,18 @@ Protect the file:
 chmod 600 /srv/badminton-video-vault/.env
 ```
 
-Important details:
-
-- `sqlite:////` has four slashes because the database path is absolute.
-- `APP_BASE_URL` is used in password-reset and magic-login email links.
-- After HTTPS is configured, change `APP_BASE_URL` to the final `https://` URL and restart the service.
-
-### 8.4 — Initialise the database and administrator
+### 7.3 — Initialise the database and admin
 
 ```bash
 cd /srv/badminton-video-vault
 source venv/bin/activate
-
 flask init-db
 flask create-admin
 ```
 
-### 8.5 — Manual smoke test
+No database migration is required when upgrading from the older server-upload implementation; the existing `videos` schema is reused.
 
-Run Gunicorn temporarily:
+### 7.4 — Manual smoke test
 
 ```bash
 cd /srv/badminton-video-vault
@@ -595,24 +471,19 @@ source venv/bin/activate
 gunicorn --bind 127.0.0.1:5000 --workers 1 app:app
 ```
 
-In a second session:
+In another session:
 
 ```bash
 curl -i http://127.0.0.1:5000/login
 ```
 
-Expect `HTTP/1.1 200 OK`. Stop the temporary Gunicorn process with `Ctrl+C`.
+Expect `HTTP/1.1 200 OK`, then stop the temporary Gunicorn with `Ctrl+C`.
 
 ---
 
-## Part 9 — Configure Gunicorn with systemd
+## Part 8 — Configure Gunicorn and systemd
 
-The service below fixes two important deployment hazards:
-
-1. `RuntimeDirectory=` creates a writable directory under `/run` for the unprivileged `ubuntu` process.
-2. One worker avoids exhausting a 1 GiB micro instance during a large upload.
-
-### 9.1 — Create the service
+Create:
 
 ```bash
 sudo nano /etc/systemd/system/badminton-vault.service
@@ -639,7 +510,7 @@ UMask=0007
 
 ExecStart=/srv/badminton-video-vault/venv/bin/gunicorn \
     --workers 1 \
-    --timeout 1200 \
+    --timeout 120 \
     --bind unix:/run/badminton-vault/badminton-vault.sock \
     --access-logfile /var/log/badminton-vault/access.log \
     --error-logfile /var/log/badminton-vault/error.log \
@@ -653,42 +524,25 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Why these values:
+Why:
 
-- `--workers 1`: appropriate for the documented 1 GiB micro instance.
-- `--timeout 1200`: allows up to 20 minutes for a slow large upload before a silent synchronous worker is killed.
-- `RuntimeDirectory=badminton-vault`: avoids `Permission denied` when binding directly under `/run`.
-- `UMask=0007`: allows Nginx, running in the `www-data` group, to use the socket.
+- One worker is the safe baseline for a roughly 1 GiB micro instance.
+- The 20-minute upload timeout is no longer needed because video bytes bypass Gunicorn.
+- `RuntimeDirectory=` avoids permission errors from binding directly under `/run`.
+- `UMask=0007` allows Nginx, in group `www-data`, to access the socket.
 
-If you resize to substantially more RAM, increase worker count only after monitoring memory under realistic uploads.
-
-### 9.2 — Start and verify
+Start and verify:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable badminton-vault
 sudo systemctl restart badminton-vault
-
 sleep 5
 sudo systemctl status badminton-vault --no-pager -l
-```
-
-Confirm:
-
-```bash
 ls -l /run/badminton-vault/
-ps aux | grep '[g]unicorn'
 ```
 
-You should see:
-
-```text
-/run/badminton-vault/badminton-vault.sock
-```
-
-and one Gunicorn master plus one worker.
-
-### 9.3 — Configure log rotation
+Configure log rotation:
 
 ```bash
 sudo tee /etc/logrotate.d/badminton-vault > /dev/null <<'EOF'
@@ -706,15 +560,15 @@ EOF
 
 ---
 
-## Part 10 — Configure Nginx
+## Part 9 — Configure Nginx
 
-### 10.1 — Create the site
+Create:
 
 ```bash
 sudo nano /etc/nginx/sites-available/badminton-vault
 ```
 
-For initial access by Elastic IP or EC2 public DNS name:
+Use this initial catch-all configuration:
 
 ```nginx
 server {
@@ -723,65 +577,50 @@ server {
 
     server_name _;
 
-    client_max_body_size 2G;
+    # Flask receives forms and JSON only. Video parts go directly to S3.
+    client_max_body_size 4M;
 
-    client_body_timeout 1200s;
-    proxy_read_timeout 1200s;
-    proxy_send_timeout 1200s;
-    proxy_connect_timeout 60s;
+    client_body_timeout 60s;
+    proxy_read_timeout 120s;
+    proxy_send_timeout 120s;
+    proxy_connect_timeout 30s;
 
     location / {
         include proxy_params;
         proxy_pass http://unix:/run/badminton-vault/badminton-vault.sock;
-
-        # Avoid Nginx buffering the entire large request body before proxying.
-        proxy_request_buffering off;
     }
 }
 ```
 
-The request still passes through Flask and Gunicorn. Disabling Nginx request buffering does not remove the application server's RAM and temporary-storage requirements.
-
-### 10.2 — Disable the Ubuntu default site
-
-Without this step, browsing by public DNS name can show **Welcome to nginx!** instead of the application.
+Disable Ubuntu's default site and enable the application:
 
 ```bash
 sudo rm -f /etc/nginx/sites-enabled/default
-
 sudo ln -sf \
   /etc/nginx/sites-available/badminton-vault \
   /etc/nginx/sites-enabled/badminton-vault
-```
 
-### 10.3 — Test and reload
-
-```bash
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-Test inside EC2:
+Test:
 
 ```bash
 curl -i http://127.0.0.1/login
 ```
 
-Then browse to:
+Then browse to `http://YOUR_ELASTIC_IP`.
 
-```text
-http://YOUR_ELASTIC_IP
-```
-
-You should see the login page.
+If the browser still shows **Welcome to nginx!**, the default site remains enabled or the application site was not linked correctly.
 
 ---
 
-## Part 11 — Configure a Domain and HTTPS
+## Part 10 — Domain and HTTPS
 
-### 11.1 — Point DNS to the Elastic IP
+### 10.1 — DNS
 
-Create an `A` record:
+Create an `A` record pointing the chosen hostname to the Elastic IP, for example:
 
 ```text
 Type: A
@@ -790,35 +629,15 @@ Value: YOUR_ELASTIC_IP
 TTL: 300
 ```
 
-This example produces:
-
-```text
-vault.example.com
-```
-
-Check propagation:
+Verify:
 
 ```bash
 dig +short vault.example.com
 ```
 
-Continue only after it returns the Elastic IP.
+### 10.2 — Update Nginx and obtain a certificate
 
-### 11.2 — Set the Nginx server name
-
-Edit:
-
-```bash
-sudo nano /etc/nginx/sites-available/badminton-vault
-```
-
-Replace:
-
-```nginx
-server_name _;
-```
-
-with:
+Replace `server_name _;` with:
 
 ```nginx
 server_name vault.example.com;
@@ -829,102 +648,43 @@ Then:
 ```bash
 sudo nginx -t
 sudo systemctl reload nginx
-```
-
-Confirm `http://vault.example.com` works.
-
-### 11.3 — Install Certbot and obtain a certificate
-
-```bash
 sudo apt update
 sudo apt install -y certbot python3-certbot-nginx
-
 sudo certbot --nginx -d vault.example.com
-```
-
-Verify renewal:
-
-```bash
-sudo systemctl status certbot.timer --no-pager
 sudo certbot renew --dry-run
 ```
 
-### 11.4 — Update `APP_BASE_URL`
+### 10.3 — Update both application and S3 origin settings
 
-After HTTPS works:
-
-```bash
-nano /srv/badminton-video-vault/.env
-```
-
-Change:
-
-```ini
-APP_BASE_URL=http://YOUR_ELASTIC_IP
-```
-
-to:
+Change `.env`:
 
 ```ini
 APP_BASE_URL=https://vault.example.com
 ```
 
-Restart:
+Restart Gunicorn:
 
 ```bash
 sudo systemctl restart badminton-vault
 ```
 
-No database recreation or reinstall is required.
+Then update the S3 CORS rule so `AllowedOrigins` contains the exact HTTPS origin. Keep the old HTTP/IP origin only during migration, then remove it.
 
 ---
 
-## Part 12 — Continuous Deployment from GitHub
+## Part 11 — Deploy Updates
 
-The repository includes `.github/workflows/deploy.yml`. It:
-
-1. Runs all smoke tests for pull requests and pushes to `main`.
-2. Deploys only after a successful push to `main`.
-3. Pulls code on EC2, updates dependencies, restarts Gunicorn, and checks the Unix socket.
-
-The health check must use:
-
-```text
-/run/badminton-vault/badminton-vault.sock
-```
-
-### 12.1 — Required GitHub secrets
-
-Under **Repository → Settings → Secrets and variables → Actions**, add:
-
-| Secret | Value |
-|---|---|
-| `EC2_HOST` | Elastic IP or production hostname |
-| `EC2_SSH_KEY` | Complete private `.pem` key contents |
-
-### 12.2 — SSH security tradeoff
-
-A GitHub-hosted runner must reach port 22. GitHub publishes changing runner IP ranges, so permanently allowing a small static source list is not straightforward.
-
-Preferred production approaches are:
-
-- AWS Systems Manager deployment
-- A self-hosted runner inside the VPC
-- A controlled deployment host with a fixed source IP
-
-Opening port 22 to `0.0.0.0/0` merely to support GitHub Actions increases attack exposure and is not the default recommendation in this guide. For a small initial deployment, manual pull-and-restart is safer while SSH remains restricted to your IP.
-
-### 12.3 — Manual deployment
+### 11.1 — Manual deployment
 
 ```bash
 cd /srv/badminton-video-vault
-git pull origin main
+git pull --ff-only origin main
 source venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 sudo systemctl restart badminton-vault
 ```
 
-Verify:
+Verify over the socket:
 
 ```bash
 curl --fail --silent --show-error \
@@ -933,89 +693,34 @@ curl --fail --silent --show-error \
   && echo "Application is healthy"
 ```
 
----
+### 11.2 — GitHub Actions
 
-## Database and Backup Options
+The included `.github/workflows/deploy.yml`:
 
-### SQLite on the EC2 root volume
+1. Runs every discovered `tests/smoke_*.py` test.
+2. Deploys only on a successful push to `main`.
+3. Pulls with `--ff-only`, installs dependencies, restarts the service, and checks the correct nested socket.
 
-SQLite is suitable for this guide's single-instance, light-concurrency deployment.
+Required repository secrets:
 
-```ini
-DATABASE_URL=sqlite:////srv/badminton-video-vault/data/badminton_vault.db
-```
+| Secret | Value |
+|---|---|
+| `EC2_HOST` | Elastic IP or production hostname |
+| `EC2_SSH_KEY` | Complete private `.pem` key contents |
 
-Limitations:
-
-- Only one EC2 application instance should write to the file.
-- SQLite is not a substitute for a managed database in an auto-scaled design.
-- The root EBS volume is a single point of failure unless backed up.
-
-### Safe SQLite backup to S3
-
-Create:
-
-```bash
-mkdir -p /srv/badminton-video-vault/scripts
-nano /srv/badminton-video-vault/scripts/backup-db.sh
-```
-
-Use:
-
-```bash
-#!/bin/bash
-set -euo pipefail
-
-DATA_DIR=/srv/badminton-video-vault/data
-BACKUP_DIR="$DATA_DIR/backups"
-BUCKET_NAME=your-exact-bucket-name
-TIMESTAMP="$(date +%Y%m%d%H%M%S)"
-BACKUP_FILE="$BACKUP_DIR/badminton_vault-$TIMESTAMP.db"
-
-mkdir -p "$BACKUP_DIR"
-
-sqlite3 "$DATA_DIR/badminton_vault.db" \
-  ".backup '$BACKUP_FILE'"
-
-aws s3 cp "$BACKUP_FILE" \
-  "s3://$BUCKET_NAME/backups/$(basename "$BACKUP_FILE")"
-```
-
-Then:
-
-```bash
-chmod +x /srv/badminton-video-vault/scripts/backup-db.sh
-```
-
-Run it manually once before scheduling it. The EC2 role supplies AWS CLI credentials automatically.
-
-Example daily cron entry:
-
-```cron
-0 2 * * * /srv/badminton-video-vault/scripts/backup-db.sh
-```
-
-Also take periodic EBS snapshots or use AWS Backup.
-
-### RDS
-
-Use Amazon RDS PostgreSQL when you need multiple application instances, managed backups, stronger concurrency, or an architecture where the local filesystem is ephemeral.
-
-Never expose PostgreSQL directly to `0.0.0.0/0`. Allow port 5432 only from the EC2 application's security group.
+A GitHub-hosted runner must reach port 22. Prefer SSM, a self-hosted runner inside the VPC, or a controlled source IP rather than opening SSH globally solely for CI/CD.
 
 ---
 
-## Verify the Complete Setup
+## Part 12 — Verify the Complete Setup
 
-### 1 — Verify the EC2 role
+### 12.1 — Role and S3 access
 
 ```bash
 aws sts get-caller-identity
 ```
 
-### 2 — Verify S3 object operations
-
-From `/srv/badminton-video-vault` with the virtual environment active:
+Then, from the application directory with the virtual environment active:
 
 ```bash
 python - <<'PY'
@@ -1023,22 +728,20 @@ import os
 import boto3
 from dotenv import load_dotenv
 
-load_dotenv("/srv/badminton-video-vault/.env")
+load_dotenv('/srv/badminton-video-vault/.env')
+region = os.environ['AWS_REGION']
+bucket = os.environ['S3_BUCKET_NAME']
+key = 'deployment-tests/connectivity-test.txt'
 
-region = os.environ["AWS_REGION"]
-bucket = os.environ["S3_BUCKET_NAME"]
-key = "deployment-tests/connectivity-test.txt"
-
-s3 = boto3.client("s3", region_name=region)
-s3.put_object(Bucket=bucket, Key=key, Body=b"connectivity test")
-s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+s3 = boto3.client('s3', region_name=region)
+s3.put_object(Bucket=bucket, Key=key, Body=b'connectivity test')
+s3.head_object(Bucket=bucket, Key=key)
 s3.delete_object(Bucket=bucket, Key=key)
-
-print(f"S3 put/get/delete succeeded for {bucket} in {region}")
+print(f'S3 put/head/delete succeeded for {bucket} in {region}')
 PY
 ```
 
-### 3 — Verify services and socket
+### 12.2 — Services
 
 ```bash
 sudo systemctl is-active badminton-vault
@@ -1047,161 +750,93 @@ ls -l /run/badminton-vault/badminton-vault.sock
 curl -i http://127.0.0.1/login
 ```
 
-### 4 — Verify uploads progressively
+### 12.3 — Direct multipart upload
 
-1. Upload a small MP4, such as 10–30 MB.
-2. Confirm the object appears under `videos/<user-id>/` in S3.
-3. Confirm playback and deletion.
-4. Only then test a larger file.
+1. Open browser developer tools → **Network**.
+2. Upload a small MP4 first.
+3. Confirm small JSON calls to `/api/uploads/multipart/initiate` and `/complete`.
+4. Confirm multiple `PUT` requests go directly to an S3 hostname, not to the EC2 hostname.
+5. Confirm the final object appears under `videos/<user-id>/` in S3.
+6. Confirm a `Video` record appears in the UI and playback works.
+7. Test **Cancel Upload** and verify no video record is created.
+8. Test the intended large-file range only after the small test succeeds.
 
-For a large-file test, monitor:
-
-```bash
-watch -n 1 'free -h; echo; swapon --show'
-```
-
-and in another session:
-
-```bash
-sudo tail -f \
-  /var/log/badminton-vault/error.log \
-  /var/log/nginx/error.log
-```
+During a direct upload, EC2 RAM and disk should remain comparatively steady. The user's browser and network carry the video bytes.
 
 ---
 
-## Maintenance
+## Backups and Maintenance
 
-### Logs
+### SQLite backup
+
+Use SQLite's backup command rather than copying a live database file:
+
+```bash
+mkdir -p /srv/badminton-video-vault/data/backups
+sqlite3 /srv/badminton-video-vault/data/badminton_vault.db \
+  ".backup '/srv/badminton-video-vault/data/backups/badminton_vault-$(date +%Y%m%d%H%M%S).db'"
+```
+
+Upload backups to an S3 `backups/` prefix or use EBS snapshots/AWS Backup. Test restoration periodically.
+
+### Logs and status
 
 ```bash
 sudo tail -f /var/log/badminton-vault/error.log
 sudo tail -f /var/log/badminton-vault/access.log
-sudo journalctl -u badminton-vault -f
 sudo tail -f /var/log/nginx/error.log
-```
+sudo journalctl -u badminton-vault -f
 
-### Service status
-
-```bash
 sudo systemctl status badminton-vault --no-pager -l
 sudo systemctl status nginx --no-pager -l
 ```
 
-### Restart
+### Resource checks
 
 ```bash
-sudo systemctl restart badminton-vault
-sudo systemctl reload nginx
-```
-
-### Check disk, RAM, and swap
-
-```bash
-df -h / /tmp
 free -h
 swapon --show
+df -h / /tmp
 ```
 
-### Apply Ubuntu security updates
+### Updates
 
 ```bash
 sudo apt update
 sudo apt upgrade -y
 ```
 
-Reboot when required:
-
-```bash
-sudo reboot
-```
-
-After reconnecting:
-
-```bash
-sudo systemctl is-active badminton-vault
-sudo systemctl is-active nginx
-```
-
----
-
-## Security Best Practices
-
-- Keep S3 Block Public Access enabled.
-- Use the EC2 role instead of static access keys.
-- Restrict SSH to your IP, an EC2 Instance Connect prefix list, SSM, or a controlled deployment source.
-- Keep `.env` at mode `600`.
-- Use a strong `FLASK_SECRET_KEY`.
-- Use HTTPS before storing real user credentials or sensitive session metadata.
-- Keep `PRESIGNED_URL_EXPIRY` as short as practical.
-- Enable EBS encryption and scheduled backups.
-- Do not commit SQLite databases, `.env`, private keys, Mailgun keys, or uploaded media.
-- Keep Mailgun integration on the HTTP API settings documented here; do not add SMTP credentials unless the application is intentionally redesigned.
-- Review logs after repeated failed logins, upload failures, worker restarts, or OOM events.
-
----
-
-## Capacity and Cost Notes
-
-### Memory
-
-A 1 GiB instance can run this application for light use with:
-
-- One Gunicorn worker
-- A 2 GiB swap file
-- Limited simultaneous requests
-- Progressive testing of upload sizes
-
-Swap is an emergency buffer, not equivalent to RAM. Resize the instance if large uploads regularly consume swap or if more concurrent users are required.
-
-### Disk
-
-A 20 GiB root volume is normally sufficient for the application, SQLite, logs, swap, and temporary data when videos are stored in S3. Check:
-
-```bash
-df -h / /tmp
-```
-
-The free space should comfortably exceed the largest upload plus operating-system headroom.
-
-### Public IPv4 and AWS service pricing
-
-EC2, EBS, S3, data transfer, public IPv4, snapshots, and RDS pricing varies by region and changes over time. Use AWS Pricing Calculator, Cost Explorer, Budgets, and the current service pricing pages rather than relying on fixed values in this guide.
+After a required reboot, verify both services again.
 
 ---
 
 ## Troubleshooting
 
-### Package installation
+### Direct upload and S3
 
-| Symptom | Cause | Fix |
+| Symptom | Likely cause | Fix |
 |---|---|---|
-| `Unable to locate package python3-pip` | Package index was not refreshed or Universe is disabled | Run `sudo apt update`; enable Universe as shown in Part 7.3 |
-| `Package awscli has no installation candidate` | Ubuntu repository package unavailable or unsupported | Install official AWS CLI v2 as shown in Part 7.4 |
-| `System restart required` | Kernel or core packages were upgraded | Reboot, reconnect, and verify both services |
+| Browser reports a CORS/network failure | Exact application origin missing from S3 CORS | Apply Part 4; no trailing slash |
+| Browser reports missing ETag | S3 CORS does not expose `ETag` | Add `"ExposeHeaders": ["ETag"]` |
+| `AccessDenied` on initiation/completion | Wrong role policy or bucket ARN | Verify `s3:PutObject` and the exact bucket object ARN |
+| `NoCredentialsError` | Instance role missing | Attach the EC2 role and run `aws sts get-caller-identity` |
+| Upload URLs expire before completion | Upload slower than URL lifetime | Increase `S3_MULTIPART_URL_EXPIRY` and restart Gunicorn |
+| File rejected immediately | Unsupported extension or over configured size | Check `MAX_VIDEO_FILE_SIZE` and selected extension |
+| Upload reaches 100% then fails | S3 completion, object-size verification, or DB commit failed | Inspect Gunicorn error log |
+| Incomplete multipart storage accumulates | Browser closed before abort completed | Enable the seven-day lifecycle rule |
+| App returns 413 during video upload | Old upload form/JS is still deployed or video was posted to Flask | Pull latest code and verify `static/upload.js` loads |
 
-### IAM and S3
+### Gunicorn and Nginx
 
-| Symptom | Cause | Fix |
+| Symptom | Likely cause | Fix |
 |---|---|---|
-| `NoCredentialsError` | No instance role and no fallback credentials | Attach `BadmintonVideoVaultEC2Role`; verify with `aws sts get-caller-identity` |
-| `AccessDenied` on upload | Missing `s3:PutObject` or wrong bucket ARN | Correct the policy resource and action |
-| `AccessDenied` on playback | Missing `s3:GetObject` | Correct the policy |
-| `NoSuchBucket` | Wrong `S3_BUCKET_NAME` | Copy the exact bucket name |
-| `301`, redirect, or signature mismatch | Wrong bucket region | Set `AWS_REGION` to the bucket's actual region |
-| Small upload works but large upload fails | Resource exhaustion or timeout | Use one worker, 1200-second timeouts, swap, and more RAM when needed |
+| `/run/badminton-vault.sock: Permission denied` | Socket placed directly under `/run` | Use `RuntimeDirectory=badminton-vault` and the nested path |
+| `502 Bad Gateway` | Gunicorn down or socket path mismatch | Check service status and `/run/badminton-vault/badminton-vault.sock` |
+| **Welcome to nginx!** | Ubuntu default site still enabled | Remove `/etc/nginx/sites-enabled/default` |
+| Generic 500 | Application exception | Check `/var/log/badminton-vault/error.log` |
+| Worker repeatedly restarts | Startup error or OOM | Check systemd, Gunicorn log, and kernel log |
 
-### Gunicorn and systemd
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `/run/badminton-vault.sock: Permission denied` | Unprivileged process tried to create a socket directly under `/run` | Use `RuntimeDirectory=badminton-vault` and the nested socket path from Part 9 |
-| Socket does not exist | Service failed, restarted, or used a different path | Check `systemctl status`, journal, and `/var/log/badminton-vault/error.log` |
-| Status briefly says active but restart count rises | Gunicorn is crashing in a loop | Stop the service and inspect the full status and logs |
-| `Worker was sent SIGKILL! Perhaps out of memory?` | Linux OOM killer terminated a worker | Reduce to one worker, enable swap, and use an instance with more RAM |
-| Generic 500 during a large upload with no Python traceback | Worker was killed before Flask could log an exception | Check the kernel OOM log below |
-
-Check OOM activity:
+Check OOM events:
 
 ```bash
 sudo journalctl -k -b | \
@@ -1209,27 +844,18 @@ sudo journalctl -k -b | \
   tail -n 50
 ```
 
-### Nginx
+### Package and Git issues
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| **Welcome to nginx!** | Ubuntu default site is still enabled or host did not match | Remove `/etc/nginx/sites-enabled/default`; use the catch-all initial configuration |
-| `502 Bad Gateway` | Gunicorn is down or Nginx points to the wrong socket | Verify `/run/badminton-vault/badminton-vault.sock` and the `proxy_pass` path |
-| `413 Request Entity Too Large` | `client_max_body_size` is too small | Use `client_max_body_size 2G` |
-| Upload stops after several minutes | Nginx or Gunicorn timeout | Use the 1200-second values in Parts 9 and 10 |
-| Nginx configuration test fails | Syntax or duplicate default server | Run `sudo nginx -t`; ensure the Ubuntu default site is disabled |
+| Symptom | Fix |
+|---|---|
+| `Unable to locate package python3-pip` | Run `sudo apt update`, enable Universe, retry |
+| `Package awscli has no installation candidate` | Install official AWS CLI v2 as shown above |
+| Clone destination is not empty | Clone before creating `data/` |
+| Public repository asks for credentials | Use the repository's HTTPS clone URL and confirm it is public |
+| Private repository cannot clone | Configure a read-only deploy key |
+| GitHub Actions health check uses old socket | Use `/run/badminton-vault/badminton-vault.sock` |
 
-### Git and deployment
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| Clone destination is not empty | `data/` or another file was created before cloning | Remove only the unintended empty content, clone first, then create `data/` |
-| Public repository prompts for credentials | Wrong clone URL or repository is not actually public | Use the HTTPS URL shown in Part 8.1 |
-| Private repository cannot clone | No deploy key or wrong SSH config | Configure the read-only deploy key |
-| GitHub Actions health check fails after this update | Workflow still uses old socket path | Use `/run/badminton-vault/badminton-vault.sock` |
-| Password-reset link uses HTTP after HTTPS setup | `APP_BASE_URL` was not updated | Change it to the final HTTPS URL and restart Gunicorn |
-
-### Useful diagnostic bundle
+### Diagnostic bundle
 
 ```bash
 sudo systemctl status badminton-vault --no-pager -l
@@ -1246,12 +872,27 @@ aws sts get-caller-identity
 
 ---
 
+## Security and Cost Notes
+
+- Keep S3 Block Public Access enabled.
+- Restrict S3 CORS to exact application origins.
+- Use the EC2 IAM role instead of static access keys.
+- Restrict SSH to trusted sources.
+- Keep `.env` mode `600`.
+- Use HTTPS before real use.
+- Use a strong `FLASK_SECRET_KEY`; it signs sessions and upload coordination tokens.
+- Keep playback URLs short-lived and multipart URLs only as long-lived as necessary.
+- The final S3 object consumes the same storage as any other upload method. The savings are on EC2 disk, RAM, and inbound/outbound processing. Incomplete multipart parts also consume S3 storage until aborted or removed by lifecycle policy.
+- S3 requests and transfer, EC2, EBS, snapshots, and public IPv4 pricing vary by region and over time; use current AWS pricing tools.
+
+---
+
 ## Official References
 
-- [Amazon EC2 documentation](https://docs.aws.amazon.com/ec2/)
-- [Attach an IAM role to an EC2 instance](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/attach-iam-role.html)
-- [EC2 Instance Connect prerequisites](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-connect-prerequisites.html)
+- [Amazon S3 multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)
+- [Amazon S3 CORS](https://docs.aws.amazon.com/AmazonS3/latest/userguide/cors.html)
+- [S3 lifecycle for incomplete multipart uploads](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpu-abort-incomplete-mpu-lifecycle-config.html)
+- [Attach an IAM role to EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/attach-iam-role.html)
 - [AWS CLI version 2 installation](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
-- [Amazon S3 documentation](https://docs.aws.amazon.com/s3/)
 - [Gunicorn settings](https://docs.gunicorn.org/en/stable/settings.html)
 - [systemd execution directories](https://man7.org/linux/man-pages/man5/systemd.exec.5.html)
