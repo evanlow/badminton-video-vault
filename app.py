@@ -1,33 +1,36 @@
+import logging
+import math
 import os
 import secrets
-import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from functools import wraps
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import (
     Flask,
-    render_template,
-    redirect,
-    url_for,
-    flash,
-    request,
     abort,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    url_for,
 )
 from flask_login import (
+    current_user,
+    login_required,
     login_user,
     logout_user,
-    login_required,
-    current_user,
 )
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import func, or_
+from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.utils import secure_filename
 
 from config import Config
 from email_service import EmailDeliveryError, send_mailgun_email
-from extensions import db, login_manager, csrf
-from models import AuthToken, User, Video
+from extensions import csrf, db, login_manager
 from forms import (
     CreateUserForm,
     EditVideoForm,
@@ -37,19 +40,26 @@ from forms import (
     ResetPasswordForm,
     UploadVideoForm,
 )
+from models import AuthToken, User, Video
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {"mp4", "avi", "mov", "mkv", "webm"}
-ALLOWED_MIME_TYPES = {
-    "video/mp4",
-    "video/avi",
-    "video/x-msvideo",
-    "video/quicktime",
-    "video/x-matroska",
-    "video/webm",
+CONTENT_TYPE_BY_EXTENSION = {
+    "mp4": "video/mp4",
+    "avi": "video/x-msvideo",
+    "mov": "video/quicktime",
+    "mkv": "video/x-matroska",
+    "webm": "video/webm",
 }
+S3_MAX_MULTIPART_PARTS = 10_000
+UPLOAD_TOKEN_SALT = "badminton-video-vault-multipart-upload-v1"
+
+
+class UploadValidationError(ValueError):
+    """Raised when a direct-upload coordination request is invalid."""
 
 
 def create_app(config_class=Config):
@@ -74,8 +84,9 @@ if app.config.get("AUTO_CREATE_DB", False):
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# S3 and upload helpers
 # ---------------------------------------------------------------------------
+
 
 def get_s3_client():
     return boto3.client(
@@ -86,24 +97,23 @@ def get_s3_client():
     )
 
 
-def generate_presigned_upload_url(s3_key, content_type, expiry=None):
-    """Return a presigned PUT URL for direct browser-to-S3 upload."""
-    s3 = get_s3_client()
-    expiry = expiry or app.config["PRESIGNED_URL_EXPIRY"]
-    try:
-        url = s3.generate_presigned_url(
-            "put_object",
-            Params={
-                "Bucket": app.config["S3_BUCKET_NAME"],
-                "Key": s3_key,
-                "ContentType": content_type,
-            },
-            ExpiresIn=expiry,
-        )
-        return url
-    except (ClientError, BotoCoreError) as exc:
-        logger.error("Error generating presigned upload URL: %s", exc)
-        return None
+def generate_presigned_part_url(
+    s3_key, upload_id, part_number, expiry=None, s3=None
+):
+    """Return a presigned URL for one S3 multipart-upload part."""
+    s3 = s3 or get_s3_client()
+    expiry = expiry or app.config["S3_MULTIPART_URL_EXPIRY"]
+    return s3.generate_presigned_url(
+        "upload_part",
+        Params={
+            "Bucket": app.config["S3_BUCKET_NAME"],
+            "Key": s3_key,
+            "UploadId": upload_id,
+            "PartNumber": part_number,
+        },
+        ExpiresIn=expiry,
+        HttpMethod="PUT",
+    )
 
 
 def generate_presigned_play_url(s3_key, expiry=None):
@@ -111,12 +121,11 @@ def generate_presigned_play_url(s3_key, expiry=None):
     s3 = get_s3_client()
     expiry = expiry or app.config["PRESIGNED_URL_EXPIRY"]
     try:
-        url = s3.generate_presigned_url(
+        return s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": app.config["S3_BUCKET_NAME"], "Key": s3_key},
             ExpiresIn=expiry,
         )
-        return url
     except (ClientError, BotoCoreError) as exc:
         logger.error("Error generating presigned play URL: %s", exc)
         return None
@@ -128,7 +137,7 @@ def generate_presigned_download_url(s3_key, filename, expiry=None):
     s3 = get_s3_client()
     expiry = expiry or app.config["PRESIGNED_URL_EXPIRY"]
     try:
-        url = s3.generate_presigned_url(
+        return s3.generate_presigned_url(
             "get_object",
             Params={
                 "Bucket": app.config["S3_BUCKET_NAME"],
@@ -137,7 +146,6 @@ def generate_presigned_download_url(s3_key, filename, expiry=None):
             },
             ExpiresIn=expiry,
         )
-        return url
     except (ClientError, BotoCoreError) as exc:
         logger.error("Error generating presigned download URL: %s", exc)
         return None
@@ -153,12 +161,220 @@ def delete_s3_object(s3_key):
         return False
 
 
+def _multipart_serializer():
+    return URLSafeTimedSerializer(app.config["SECRET_KEY"], salt=UPLOAD_TOKEN_SALT)
+
+
+def _json_error(message, status=400):
+    return jsonify({"error": message}), status
+
+
+def _client_error_code(exc):
+    if not isinstance(exc, ClientError):
+        return None
+    return exc.response.get("Error", {}).get("Code")
+
+
+def _required_json_object():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise UploadValidationError("A JSON request body is required.")
+    return payload
+
+
+def _normalise_text(value, field_name, max_length, required=False):
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise UploadValidationError(f"{field_name} must be text.")
+    value = value.strip()
+    if required and not value:
+        raise UploadValidationError(f"{field_name} is required.")
+    if len(value) > max_length:
+        raise UploadValidationError(
+            f"{field_name} must be {max_length} characters or fewer."
+        )
+    return value or None
+
+
+def _normalise_original_filename(value):
+    if not isinstance(value, str):
+        raise UploadValidationError("Filename is required.")
+
+    # Browsers normally send only the basename, but strip either path separator
+    # defensively in case a non-browser client supplies a path.
+    filename = value.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if not filename or filename in {".", ".."}:
+        raise UploadValidationError("Filename is required.")
+    if "\x00" in filename:
+        raise UploadValidationError("Filename contains an invalid character.")
+    if len(filename) > 255:
+        raise UploadValidationError("Filename must be 255 characters or fewer.")
+
+    extension = os.path.splitext(filename)[1].lower().lstrip(".")
+    if extension not in ALLOWED_EXTENSIONS:
+        raise UploadValidationError(
+            "Unsupported video format. Use MP4, AVI, MOV, MKV, or WebM."
+        )
+    return filename, extension
+
+
+def _normalise_file_size(value):
+    if isinstance(value, bool):
+        raise UploadValidationError("File size is invalid.")
+    try:
+        file_size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise UploadValidationError("File size is invalid.") from exc
+
+    if file_size <= 0:
+        raise UploadValidationError("The selected file is empty.")
+
+    maximum = int(app.config["MAX_VIDEO_FILE_SIZE"])
+    if file_size > maximum:
+        raise UploadValidationError(
+            f"The selected file exceeds the {maximum} byte upload limit."
+        )
+    return file_size
+
+
+def _normalise_session_date(value):
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise UploadValidationError("Session date is invalid.")
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise UploadValidationError("Session date must use YYYY-MM-DD format.") from exc
+
+
+def _normalise_allow_download(value):
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return False
+    raise UploadValidationError("Allow download must be true or false.")
+
+
+def _normalise_upload_metadata(payload):
+    filename, extension = _normalise_original_filename(payload.get("filename"))
+    file_size = _normalise_file_size(payload.get("file_size"))
+
+    visibility = payload.get("visibility", "private")
+    if visibility not in {"private", "shared", "public"}:
+        raise UploadValidationError("Visibility is invalid.")
+
+    return {
+        "filename": filename,
+        "extension": extension,
+        # Use a canonical type derived from the validated extension rather than
+        # trusting the browser-supplied MIME type.
+        "content_type": CONTENT_TYPE_BY_EXTENSION[extension],
+        "file_size": file_size,
+        "session_date": _normalise_session_date(payload.get("session_date")),
+        "notes": _normalise_text(payload.get("notes"), "Notes", 2000),
+        "tags": _normalise_text(payload.get("tags"), "Tags", 500),
+        "visibility": visibility,
+        "allow_download": _normalise_allow_download(payload.get("allow_download")),
+    }
+
+
+def _load_upload_token(token):
+    if not isinstance(token, str) or not token:
+        raise UploadValidationError("Upload token is required.")
+
+    try:
+        payload = _multipart_serializer().loads(
+            token,
+            max_age=int(app.config["S3_MULTIPART_TOKEN_MAX_AGE"]),
+        )
+    except SignatureExpired as exc:
+        raise UploadValidationError(
+            "This upload session has expired. Start the upload again."
+        ) from exc
+    except BadSignature as exc:
+        raise UploadValidationError("Upload token is invalid.") from exc
+
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise UploadValidationError("Upload token is invalid.")
+    if payload.get("user_id") != current_user.id:
+        raise UploadValidationError("Upload token does not belong to this user.")
+
+    required_fields = {
+        "s3_key",
+        "upload_id",
+        "filename",
+        "file_size",
+        "content_type",
+        "total_parts",
+        "metadata",
+    }
+    if not required_fields.issubset(payload):
+        raise UploadValidationError("Upload token is incomplete.")
+    if not str(payload["s3_key"]).startswith(f"videos/{current_user.id}/"):
+        raise UploadValidationError("Upload key is invalid.")
+    return payload
+
+
+def _validate_completed_parts(parts, expected_count):
+    if not isinstance(parts, list):
+        raise UploadValidationError("Completed parts must be a list.")
+    if len(parts) != expected_count:
+        raise UploadValidationError(
+            f"Expected {expected_count} uploaded parts, received {len(parts)}."
+        )
+
+    normalised = []
+    seen = set()
+    for item in parts:
+        if not isinstance(item, dict):
+            raise UploadValidationError("A completed part is invalid.")
+
+        part_number = item.get("part_number")
+        if isinstance(part_number, bool):
+            raise UploadValidationError("A completed part number is invalid.")
+        try:
+            part_number = int(part_number)
+        except (TypeError, ValueError) as exc:
+            raise UploadValidationError("A completed part number is invalid.") from exc
+
+        etag = item.get("etag")
+        if not isinstance(etag, str) or not etag.strip() or len(etag) > 200:
+            raise UploadValidationError("A completed part ETag is invalid.")
+
+        if part_number in seen:
+            raise UploadValidationError("Completed part numbers must be unique.")
+        seen.add(part_number)
+        normalised.append({"PartNumber": part_number, "ETag": etag.strip()})
+
+    normalised.sort(key=lambda item: item["PartNumber"])
+    expected_numbers = list(range(1, expected_count + 1))
+    actual_numbers = [item["PartNumber"] for item in normalised]
+    if actual_numbers != expected_numbers:
+        raise UploadValidationError("Completed parts must be numbered consecutively.")
+    return normalised
+
+
+def _abort_multipart_upload(s3, s3_key, upload_id):
+    try:
+        s3.abort_multipart_upload(
+            Bucket=app.config["S3_BUCKET_NAME"],
+            Key=s3_key,
+            UploadId=upload_id,
+        )
+    except ClientError as exc:
+        if _client_error_code(exc) != "NoSuchUpload":
+            raise
+
+
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not current_user.is_authenticated or not current_user.is_admin:
             abort(403)
         return f(*args, **kwargs)
+
     return decorated
 
 
@@ -167,7 +383,9 @@ def _normalise_email(email):
 
 
 def _request_ip():
-    return request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+    return request.headers.get(
+        "X-Forwarded-For", request.remote_addr or ""
+    ).split(",")[0].strip()
 
 
 def _user_agent():
@@ -312,14 +530,24 @@ def _find_active_user_by_email(email):
 # Flask-Login user loader
 # ---------------------------------------------------------------------------
 
+
 @login_manager.user_loader
 def load_user(user_id):
     return db.session.get(User, int(user_id))
 
 
+@login_manager.unauthorized_handler
+def unauthorized():
+    if request.path.startswith("/api/"):
+        return _json_error("Your login session has expired. Sign in and try again.", 401)
+    flash(login_manager.login_message, login_manager.login_message_category)
+    return redirect(url_for("login", next=request.url))
+
+
 # ---------------------------------------------------------------------------
 # Auth routes
 # ---------------------------------------------------------------------------
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -367,7 +595,10 @@ def reset_password(token):
 
     auth_token = AuthToken.find_usable(token, AuthToken.PURPOSE_RESET_PASSWORD)
     if not auth_token:
-        flash("This password reset link is invalid, expired, or has already been used.", "danger")
+        flash(
+            "This password reset link is invalid, expired, or has already been used.",
+            "danger",
+        )
         return redirect(url_for("forgot_password"))
 
     form = ResetPasswordForm()
@@ -382,7 +613,10 @@ def reset_password(token):
         )
         db.session.commit()
 
-        flash("Your password has been reset. Please log in with your new password.", "success")
+        flash(
+            "Your password has been reset. Please log in with your new password.",
+            "success",
+        )
         return redirect(url_for("login"))
 
     return render_template("reset_password.html", form=form)
@@ -412,7 +646,10 @@ def consume_magic_login(token):
 
     auth_token = AuthToken.find_usable(token, AuthToken.PURPOSE_MAGIC_LOGIN)
     if not auth_token:
-        flash("This magic login link is invalid, expired, or has already been used.", "danger")
+        flash(
+            "This magic login link is invalid, expired, or has already been used.",
+            "danger",
+        )
         return redirect(url_for("magic_login"))
 
     user = auth_token.user
@@ -433,6 +670,7 @@ def consume_magic_login(token):
 # Main routes
 # ---------------------------------------------------------------------------
 
+
 @app.route("/")
 @login_required
 def index():
@@ -449,7 +687,9 @@ def dashboard():
         .limit(5)
         .all()
     )
-    return render_template("dashboard.html", total_videos=total_videos, recent_videos=recent_videos)
+    return render_template(
+        "dashboard.html", total_videos=total_videos, recent_videos=recent_videos
+    )
 
 
 @app.route("/upload", methods=["GET", "POST"])
@@ -457,66 +697,240 @@ def dashboard():
 def upload():
     form = UploadVideoForm()
 
-    if form.validate_on_submit():
-        file = form.video_file.data
-        original_filename = file.filename
-        if not original_filename:
-            flash("No file selected.", "danger")
-            return render_template("upload.html", form=form)
-
-        extension = os.path.splitext(original_filename)[1].lower().lstrip(".")
-        if extension not in ALLOWED_EXTENSIONS:
-            flash("Invalid file type. Please upload a video file (mp4, avi, mov, mkv, webm).", "danger")
-            return render_template("upload.html", form=form)
-
-        content_type = file.content_type or "video/mp4"
-        if content_type not in ALLOWED_MIME_TYPES:
-            flash("Invalid file type. Please upload a video file.", "danger")
-            return render_template("upload.html", form=form)
-
-        unique_name = f"{secrets.token_hex(16)}.{extension}"
-        s3_key = f"videos/{current_user.id}/{unique_name}"
-
-        # Read file size before streaming
-        file.stream.seek(0, 2)
-        file_size = file.stream.tell()
-        file.stream.seek(0)
-
-        # Upload directly via boto3 (server-side)
-        s3 = get_s3_client()
-        try:
-            s3.upload_fileobj(
-                file.stream,
-                app.config["S3_BUCKET_NAME"],
-                s3_key,
-                ExtraArgs={"ContentType": content_type},
-            )
-        except (ClientError, BotoCoreError) as exc:
-            logger.error("S3 upload failed: %s", exc)
-            flash("Upload to S3 failed. Please try again.", "danger")
-            return render_template("upload.html", form=form)
-
-        video = Video(
-            filename=original_filename,
-            s3_key=s3_key,
-            uploaded_by_user_id=current_user.id,
-            session_date=form.session_date.data,
-            file_size=file_size,
-            notes=form.notes.data,
-            tags=form.tags.data,
-            visibility=form.visibility.data,
-            allow_download=form.allow_download.data,
+    # static/upload.js coordinates the upload. With JavaScript disabled, never
+    # accept a multipart video body through Flask.
+    if request.method == "POST":
+        flash(
+            "Direct video upload requires JavaScript. Enable JavaScript and try again.",
+            "warning",
         )
-        if video.visibility == "shared":
-            video.share_token = secrets.token_urlsafe(32)
-            video.share_expires_at = datetime.utcnow() + timedelta(days=30)
 
+    return render_template(
+        "upload.html",
+        form=form,
+        max_video_file_size=int(app.config["MAX_VIDEO_FILE_SIZE"]),
+        multipart_upload_concurrency=int(app.config["S3_MULTIPART_CONCURRENCY"]),
+    )
+
+
+@app.post("/api/uploads/multipart/initiate")
+@login_required
+def multipart_upload_initiate():
+    try:
+        metadata = _normalise_upload_metadata(_required_json_object())
+    except UploadValidationError as exc:
+        return _json_error(str(exc))
+
+    part_size = int(app.config["S3_MULTIPART_PART_SIZE"])
+    total_parts = math.ceil(metadata["file_size"] / part_size)
+    if total_parts > S3_MAX_MULTIPART_PARTS:
+        return _json_error(
+            "The selected file requires too many multipart-upload parts."
+        )
+
+    unique_name = f"{secrets.token_hex(16)}.{metadata['extension']}"
+    s3_key = f"videos/{current_user.id}/{unique_name}"
+    s3 = get_s3_client()
+    upload_id = None
+
+    try:
+        response = s3.create_multipart_upload(
+            Bucket=app.config["S3_BUCKET_NAME"],
+            Key=s3_key,
+            ContentType=metadata["content_type"],
+        )
+        upload_id = response["UploadId"]
+
+        part_urls = [
+            {
+                "part_number": part_number,
+                "url": generate_presigned_part_url(
+                    s3_key, upload_id, part_number, s3=s3
+                ),
+            }
+            for part_number in range(1, total_parts + 1)
+        ]
+    except (ClientError, BotoCoreError, KeyError) as exc:
+        if upload_id:
+            try:
+                _abort_multipart_upload(s3, s3_key, upload_id)
+            except (ClientError, BotoCoreError):
+                logger.exception(
+                    "Failed to clean up multipart upload after initiation error"
+                )
+        logger.exception("Could not initiate S3 multipart upload: %s", exc)
+        return _json_error("Could not start the S3 upload. Please try again.", 502)
+
+    upload_token = _multipart_serializer().dumps(
+        {
+            "version": 1,
+            "user_id": current_user.id,
+            "s3_key": s3_key,
+            "upload_id": upload_id,
+            "filename": metadata["filename"],
+            "file_size": metadata["file_size"],
+            "content_type": metadata["content_type"],
+            "total_parts": total_parts,
+            "metadata": {
+                "session_date": metadata["session_date"],
+                "notes": metadata["notes"],
+                "tags": metadata["tags"],
+                "visibility": metadata["visibility"],
+                "allow_download": metadata["allow_download"],
+            },
+        }
+    )
+
+    return jsonify(
+        {
+            "upload_token": upload_token,
+            "part_size": part_size,
+            "total_parts": total_parts,
+            "parts": part_urls,
+            "expires_in": int(app.config["S3_MULTIPART_URL_EXPIRY"]),
+        }
+    )
+
+
+@app.post("/api/uploads/multipart/complete")
+@login_required
+def multipart_upload_complete():
+    try:
+        request_payload = _required_json_object()
+        upload_payload = _load_upload_token(request_payload.get("upload_token"))
+        completed_parts = _validate_completed_parts(
+            request_payload.get("parts"),
+            int(upload_payload["total_parts"]),
+        )
+    except UploadValidationError as exc:
+        return _json_error(str(exc))
+
+    existing = Video.query.filter_by(s3_key=upload_payload["s3_key"]).first()
+    if existing:
+        if existing.uploaded_by_user_id != current_user.id:
+            return _json_error("The upload record belongs to another user.", 403)
+        return jsonify(
+            {
+                "video_id": existing.id,
+                "redirect_url": url_for("video_detail", video_id=existing.id),
+            }
+        )
+
+    s3 = get_s3_client()
+    try:
+        s3.complete_multipart_upload(
+            Bucket=app.config["S3_BUCKET_NAME"],
+            Key=upload_payload["s3_key"],
+            UploadId=upload_payload["upload_id"],
+            MultipartUpload={"Parts": completed_parts},
+        )
+        head = s3.head_object(
+            Bucket=app.config["S3_BUCKET_NAME"],
+            Key=upload_payload["s3_key"],
+        )
+    except ClientError as exc:
+        code = _client_error_code(exc)
+        logger.exception("Could not complete S3 multipart upload: %s", exc)
+        if code == "NoSuchUpload":
+            return _json_error(
+                "This upload session no longer exists. Start the upload again.",
+                409,
+            )
+        return _json_error("S3 could not complete the upload. Please try again.", 502)
+    except BotoCoreError as exc:
+        logger.exception("Could not complete S3 multipart upload: %s", exc)
+        return _json_error("S3 could not complete the upload. Please try again.", 502)
+
+    actual_size = int(head.get("ContentLength", -1))
+    if actual_size != int(upload_payload["file_size"]):
+        logger.error(
+            "Completed upload size mismatch for %s: expected=%s actual=%s",
+            upload_payload["s3_key"],
+            upload_payload["file_size"],
+            actual_size,
+        )
+        try:
+            s3.delete_object(
+                Bucket=app.config["S3_BUCKET_NAME"],
+                Key=upload_payload["s3_key"],
+            )
+        except (ClientError, BotoCoreError):
+            logger.exception("Could not delete S3 object after size mismatch")
+        return _json_error(
+            "The completed S3 object size did not match the selected file. Upload it again.",
+            409,
+        )
+
+    metadata = upload_payload["metadata"]
+    session_date = (
+        date.fromisoformat(metadata["session_date"])
+        if metadata.get("session_date")
+        else None
+    )
+    video = Video(
+        filename=upload_payload["filename"],
+        s3_key=upload_payload["s3_key"],
+        uploaded_by_user_id=current_user.id,
+        session_date=session_date,
+        file_size=upload_payload["file_size"],
+        notes=metadata.get("notes"),
+        tags=metadata.get("tags"),
+        visibility=metadata["visibility"],
+        allow_download=bool(metadata["allow_download"]),
+    )
+    if video.visibility == "shared":
+        video.share_token = secrets.token_urlsafe(32)
+        video.share_expires_at = datetime.utcnow() + timedelta(days=30)
+
+    try:
         db.session.add(video)
         db.session.commit()
-        flash("Video uploaded successfully!", "success")
-        return redirect(url_for("video_detail", video_id=video.id))
+    except SQLAlchemyError as exc:
+        db.session.rollback()
+        logger.exception("Could not save completed upload metadata: %s", exc)
+        try:
+            s3.delete_object(
+                Bucket=app.config["S3_BUCKET_NAME"],
+                Key=upload_payload["s3_key"],
+            )
+        except (ClientError, BotoCoreError):
+            logger.exception(
+                "Could not remove orphaned S3 object after database error"
+            )
+        return _json_error(
+            "The video uploaded, but its metadata could not be saved.", 500
+        )
 
-    return render_template("upload.html", form=form)
+    flash("Video uploaded successfully!", "success")
+    return jsonify(
+        {
+            "video_id": video.id,
+            "redirect_url": url_for("video_detail", video_id=video.id),
+        }
+    )
+
+
+@app.post("/api/uploads/multipart/abort")
+@login_required
+def multipart_upload_abort():
+    try:
+        request_payload = _required_json_object()
+        upload_payload = _load_upload_token(request_payload.get("upload_token"))
+    except UploadValidationError as exc:
+        return _json_error(str(exc))
+
+    s3 = get_s3_client()
+    try:
+        _abort_multipart_upload(
+            s3,
+            upload_payload["s3_key"],
+            upload_payload["upload_id"],
+        )
+    except (ClientError, BotoCoreError) as exc:
+        logger.exception("Could not abort S3 multipart upload: %s", exc)
+        return _json_error("Could not cancel the S3 upload.", 502)
+
+    return jsonify({"aborted": True})
 
 
 @app.route("/videos")
@@ -538,7 +952,9 @@ def videos():
     if visibility_filter:
         query = query.filter(Video.visibility == visibility_filter)
 
-    pagination = query.order_by(Video.created_at.desc()).paginate(page=page, per_page=12, error_out=False)
+    pagination = query.order_by(Video.created_at.desc()).paginate(
+        page=page, per_page=12, error_out=False
+    )
     return render_template(
         "videos.html",
         pagination=pagination,
@@ -555,7 +971,6 @@ def video_detail(video_id):
         abort(404)
 
     can_edit = video.uploaded_by_user_id == current_user.id or current_user.is_admin
-    # Allow access if owner, admin, or video is public
     if not can_edit and video.visibility != "public":
         abort(403)
 
@@ -569,7 +984,10 @@ def video_detail(video_id):
 
         if video.visibility == "shared" and (
             not video.share_token
-            or (video.share_expires_at and video.share_expires_at < datetime.utcnow())
+            or (
+                video.share_expires_at
+                and video.share_expires_at < datetime.utcnow()
+            )
         ):
             video.share_token = secrets.token_urlsafe(32)
             video.share_expires_at = datetime.utcnow() + timedelta(days=30)
@@ -606,7 +1024,10 @@ def delete_video(video_id):
 
     s3_deleted = delete_s3_object(video.s3_key)
     if not s3_deleted:
-        flash("Could not delete the video file from storage. The video record has been kept.", "danger")
+        flash(
+            "Could not delete the video file from storage. The video record has been kept.",
+            "danger",
+        )
         return redirect(url_for("video_detail", video_id=video_id))
 
     db.session.delete(video)
@@ -622,7 +1043,7 @@ def shared_video(token):
     if video.visibility not in ("shared", "public"):
         abort(404)
     if video.share_expires_at and video.share_expires_at < datetime.utcnow():
-        abort(410)  # Gone
+        abort(410)
 
     play_url = generate_presigned_play_url(video.s3_key)
     download_url = None
@@ -643,6 +1064,7 @@ def shared_video(token):
 # Admin routes
 # ---------------------------------------------------------------------------
 
+
 @app.route("/admin/users")
 @login_required
 @admin_required
@@ -653,7 +1075,9 @@ def admin_users():
         .group_by(Video.uploaded_by_user_id)
         .all()
     )
-    return render_template("admin_users.html", users=users, video_counts=video_counts)
+    return render_template(
+        "admin_users.html", users=users, video_counts=video_counts
+    )
 
 
 @app.route("/admin/users/create", methods=["GET", "POST"])
@@ -702,34 +1126,58 @@ def admin_toggle_user(user_id):
 # Error handlers
 # ---------------------------------------------------------------------------
 
+
 @app.errorhandler(403)
 def forbidden(e):
-    return render_template("error.html", code=403, message="You don't have permission to access this page."), 403
+    return render_template(
+        "error.html",
+        code=403,
+        message="You don't have permission to access this page.",
+    ), 403
 
 
 @app.errorhandler(404)
 def not_found(e):
-    return render_template("error.html", code=404, message="The page you're looking for doesn't exist."), 404
+    return render_template(
+        "error.html", code=404, message="The page you're looking for doesn't exist."
+    ), 404
 
 
 @app.errorhandler(410)
 def gone(e):
-    return render_template("error.html", code=410, message="This share link has expired."), 410
+    return render_template(
+        "error.html", code=410, message="This share link has expired."
+    ), 410
+
+
+@app.errorhandler(413)
+def request_too_large(e):
+    if request.path.startswith("/api/"):
+        return _json_error("The request body is too large.", 413)
+    return render_template(
+        "error.html",
+        code=413,
+        message="This request is too large. Video files must be uploaded directly to S3.",
+    ), 413
 
 
 @app.errorhandler(500)
 def server_error(e):
-    return render_template("error.html", code=500, message="An internal server error occurred."), 500
+    return render_template(
+        "error.html", code=500, message="An internal server error occurred."
+    ), 500
 
 
 # ---------------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------------
 
+
 @app.cli.command("init-db")
 def init_db():
     """Create database tables (run once before first use)."""
     import click
+
     with app.app_context():
         db.create_all()
     click.echo("Database tables created.")
@@ -739,9 +1187,12 @@ def init_db():
 def create_admin():
     """Create an initial admin user interactively."""
     import click
+
     email = click.prompt("Admin email")
     name = click.prompt("Admin name")
-    password = click.prompt("Admin password", hide_input=True, confirmation_prompt=True)
+    password = click.prompt(
+        "Admin password", hide_input=True, confirmation_prompt=True
+    )
 
     existing = User.query.filter_by(email=_normalise_email(email)).first()
     if existing:
