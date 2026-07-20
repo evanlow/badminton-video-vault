@@ -1,6 +1,6 @@
 # Badminton Video Vault — User Guide
 
-Welcome to **Badminton Video Vault**, your personal platform for uploading, organizing, and sharing badminton session videos. This guide will walk you through everything you need to get started and make the most of the application.
+Badminton Video Vault is a private web application for uploading, organising, playing, and sharing badminton session videos.
 
 ---
 
@@ -11,7 +11,7 @@ Welcome to **Badminton Video Vault**, your personal platform for uploading, orga
 3. [Dashboard](#dashboard)
 4. [Uploading Videos](#uploading-videos)
 5. [Browsing Your Video Library](#browsing-your-video-library)
-6. [Viewing & Playing Videos](#viewing--playing-videos)
+6. [Viewing and Playing Videos](#viewing-and-playing-videos)
 7. [Editing Video Details](#editing-video-details)
 8. [Sharing Videos](#sharing-videos)
 9. [Downloading Videos](#downloading-videos)
@@ -24,286 +24,224 @@ Welcome to **Badminton Video Vault**, your personal platform for uploading, orga
 
 ## Getting Started
 
-Badminton Video Vault is a web application — you access it through your browser. No software installation is required on your device.
+You need:
 
-### What You Need
+- A modern browser such as Chrome, Edge, Firefox, or Safari
+- An account created by the administrator
+- A stable internet connection, especially for large uploads
+- JavaScript enabled for video uploads
 
-- A modern web browser (Chrome, Firefox, Safari, or Edge)
-- An account created by your administrator
-- An internet connection
-
-### Supported Video Formats
-
-You can upload videos in the following formats:
+### Supported Formats
 
 | Format | Extension |
-|--------|-----------|
-| MP4    | `.mp4`    |
-| AVI    | `.avi`    |
+|---|---|
+| MP4 | `.mp4` |
+| AVI | `.avi` |
 | QuickTime | `.mov` |
-| Matroska | `.mkv`  |
-| WebM   | `.webm`   |
+| Matroska | `.mkv` |
+| WebM | `.webm` |
 
-The maximum file size for uploads is **2 GB**.
+The default maximum file size is **2 GiB**. An administrator can configure a different limit.
 
 ---
 
 ## Logging In
 
-1. Open the application URL in your browser.
-2. You will be directed to the **Login** page.
-3. Enter your **email address** and **password**.
-4. Click **Log In**.
+1. Open the application URL.
+2. Enter your email address and password.
+3. Select **Log In**.
 
-> 💡 **Tip:** If you cannot log in, contact your administrator to verify your account is active and your credentials are correct.
+After login, the application opens the Dashboard.
 
-After logging in, you will be redirected to your **Dashboard**.
-
-### Logging Out
-
-Click **Log Out** in the navigation bar at any time to securely end your session.
+Select **Log Out** from the user menu to end the session.
 
 ---
 
 ## Dashboard
 
-The Dashboard is your home screen after logging in. It provides a quick overview of your activity:
+The Dashboard shows:
 
-- **Total Videos** — the number of videos you have uploaded
-- **Recent Videos** — your 5 most recently uploaded videos for quick access
-
-From the Dashboard, you can navigate to:
-- **Upload** — add a new video
-- **Videos** — browse your full video library
+- Your total number of videos
+- Your five most recently uploaded videos
+- Links to upload a new video or browse the full library
 
 ---
 
 ## Uploading Videos
 
-### Step-by-Step
+### How Uploading Works
 
-1. Click **Upload** in the navigation menu.
-2. Fill in the upload form:
+The browser divides the video into smaller parts and sends those parts **directly to the private Amazon S3 bucket**. The application server coordinates the upload and saves the title, date, notes, tags, visibility, and file size only after S3 confirms completion.
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| Video File | ✅ Yes | Select a video file from your device (mp4, avi, mov, mkv, or webm) |
-| Session Date | No | The date the badminton session took place |
-| Notes | No | Any notes about the session (up to 2,000 characters) |
-| Tags | No | Comma-separated tags for organizing videos (e.g., `doubles, tournament, practice`) |
-| Visibility | ✅ Yes | Who can see this video (see [Sharing Videos](#sharing-videos)) |
-| Allow Download | No | Whether viewers can download the video file |
+This design avoids copying a multi-gigabyte video through the application server and allows failed parts to be retried independently.
 
-3. Click **Upload**.
-4. Wait for the upload to complete — you will be redirected to the video detail page upon success.
+### Step by Step
 
-### Tips for Uploading
+1. Select **Upload** from the navigation menu.
+2. Complete the form:
 
-- **Use descriptive tags** to make videos easy to find later (e.g., `singles, footwork, 2024`).
-- **Add a session date** to keep your library chronologically organized.
-- **Use notes** to record game scores, practice focuses, or coaching feedback.
+   | Field | Required | Description |
+   |---|---|---|
+   | Video File | Yes | MP4, AVI, MOV, MKV, or WebM |
+   | Session Date | No | Date of the badminton session |
+   | Notes | No | Up to 2,000 characters |
+   | Tags | No | Comma-separated labels such as `singles, tournament, training` |
+   | Visibility | Yes | Private, Shared link, or Public |
+   | Allow Download | No | Whether permitted viewers may download the file |
+
+3. Select **Upload**.
+4. Keep the page open while the progress bar advances.
+5. The application redirects to the video page after S3 completion and metadata verification.
+
+### Progress, Retry, and Cancellation
+
+- Several parts may upload in parallel.
+- A failed part is retried automatically up to three times.
+- Select **Cancel Upload** to stop the active requests and ask S3 to discard the incomplete upload.
+- Do not close or reload the page during an upload. Uploads do not currently resume after the page is closed.
+- If the browser cannot contact S3, verify your network and report the error message to the administrator; the bucket CORS configuration may need attention.
+
+### Large-File Tips
+
+- Prefer a stable wired or strong Wi-Fi connection.
+- Disable sleep mode during a long upload.
+- A 2 GiB upload can take many minutes on a slow upstream connection.
+- The final percentage may pause briefly while S3 combines the parts and the application saves metadata.
 
 ---
 
 ## Browsing Your Video Library
 
-Click **Videos** in the navigation menu to see your full video library.
+Select **My Videos** to see:
 
-### What You Can See
+- Every video you uploaded, regardless of visibility
+- Videos marked Public by other users
 
-- All videos **you uploaded** (regardless of visibility)
-- All videos marked as **Public** by other users
-
-### Filtering Videos
-
-Use the filters at the top of the page to narrow down results:
-
-- **By Tag** — enter a tag to show only videos with that tag
-- **By Visibility** — filter by Private, Shared, or Public videos
-
-### Pagination
-
-Videos are displayed 12 per page. Use the pagination controls at the bottom to browse through pages.
+Filter by tag or visibility. Results are paginated when the library grows.
 
 ---
 
-## Viewing & Playing Videos
+## Viewing and Playing Videos
 
-Click on any video in your library to open the **Video Detail** page.
+Open a video to:
 
-On this page you can:
+- Play it in the browser
+- View filename, session date, size, tags, notes, and visibility
+- Edit details when you are the owner or an administrator
+- Download it when downloads are enabled
+- Delete it when authorised
 
-- **Play the video** directly in your browser using the built-in video player
-- View all video metadata (filename, upload date, session date, file size, tags, notes)
-- Edit video details (if you are the uploader or an admin)
-- Download the video (if downloads are enabled)
-- Delete the video (if you are the uploader or an admin)
-
-> 💡 **Tip:** Playback links are temporary and automatically expire for security. If a video stops playing, simply refresh the page to get a new playback link.
+Playback links are temporary. Refresh the page to obtain a fresh link if playback later stops.
 
 ---
 
 ## Editing Video Details
 
-If you uploaded the video (or you are an admin), you can edit its details:
+The uploader or an administrator can change:
 
-1. Navigate to the video's detail page.
-2. Update any of the following fields:
-   - **Session Date**
-   - **Notes**
-   - **Tags**
-   - **Visibility** (Private / Shared / Public)
-   - **Allow Download** (on/off)
-3. Click **Save Changes**.
+- Session date
+- Notes
+- Tags
+- Visibility
+- Download permission
 
-Changes take effect immediately.
+Select **Save Changes** to apply the update.
 
 ---
 
 ## Sharing Videos
 
-Badminton Video Vault offers three visibility levels for each video:
+### Private
 
-### Private (Default)
+Only the uploader and administrators can access the video.
 
-- Only **you** (and admins) can see and access the video.
-- The video does not appear in other users' libraries.
+### Shared Link
 
-### Shared (Link)
-
-- Anyone with the **share link** can view the video — no login required.
-- Share links expire automatically after **30 days** for security.
-- If the link expires, change the visibility back to "Shared" to generate a fresh link.
-- Share links are displayed on the video detail page when visibility is set to "Shared".
+Anyone with the generated link can open the video without logging in. The application-level share link expires after 30 days. The S3 playback URL embedded in the page has a shorter security lifetime and is regenerated whenever the page is loaded.
 
 ### Public
 
-- The video is visible to **all logged-in users** in the Videos library.
-- Accessing a public video still requires logging in. To share a video with someone who doesn't have an account, use **Shared (link)** visibility instead.
+All logged-in users can see the video in the library.
 
-### How to Share a Video
-
-1. Go to the video's detail page.
-2. Set **Visibility** to **Shared (link)**.
-3. Click **Save Changes**.
-4. Copy the **share link** displayed on the page and send it to anyone you want to view the video — no login required.
+To share outside the user community, select **Shared (link)** rather than Public.
 
 ---
 
 ## Downloading Videos
 
-If a video has **Allow Download** enabled:
-
-- A **Download** button will appear on the video detail page.
-- Clicking it will start downloading the video file to your device.
-- Download links are temporary and expire after a set period — refresh the page if needed.
-
-> 💡 **Tip:** To enable or disable downloads for your videos, edit the video and toggle the "Allow Download" checkbox.
+A Download button appears only when **Allow Download** is enabled. Download URLs are temporary; refresh the video page when an old URL expires.
 
 ---
 
 ## Deleting Videos
 
-To permanently delete a video:
+1. Open the video.
+2. Select **Delete Video**.
+3. Confirm the warning.
 
-1. Navigate to the video's detail page.
-2. Click the **Delete** button.
-3. Confirm the deletion.
-
-> ⚠️ **Warning:** Deletion is permanent. The video file is removed from storage and cannot be recovered.
-
-Only the video's uploader or an admin can delete a video.
+Deletion removes both the S3 object and the metadata record. It cannot be undone unless an administrator has a separate backup.
 
 ---
 
 ## Admin Features
 
-If your account has the **Admin** role, you have access to additional user management features.
+Administrators can:
 
-### Managing Users
+- View user accounts
+- Create users
+- Assign User or Admin roles
+- Activate or deactivate accounts
 
-Navigate to **Admin > Users** to see a list of all registered users, including:
-
-- Name and email
-- Role (User or Admin)
-- Account status (Active / Inactive)
-- Number of videos uploaded
-
-### Creating a New User
-
-1. Go to **Admin > Users**.
-2. Click **Create User**.
-3. Fill in the form:
-   - **Full Name** — the user's display name
-   - **Email** — used for login (must be unique)
-   - **Password** — minimum 8 characters
-   - **Confirm Password** — must match
-   - **Role** — User or Admin
-4. Click **Create User**.
-
-The new user can immediately log in with the provided credentials.
-
-### Activating / Deactivating Users
-
-- Click the **Activate** or **Deactivate** button next to a user to toggle their account status.
-- Deactivated users **cannot log in** but their data (videos, etc.) is preserved.
-- You cannot deactivate your own admin account.
+Deactivation prevents login but preserves existing video metadata and S3 objects.
 
 ---
 
 ## Frequently Asked Questions
 
-### Q: What video formats can I upload?
+### What formats and sizes are accepted?
 
-**A:** MP4, AVI, MOV, MKV, and WebM files up to 2 GB in size.
+MP4, AVI, MOV, MKV, and WebM. The default maximum is 2 GiB.
 
-### Q: Can I upload multiple videos at once?
+### Can I upload several videos at once?
 
-**A:** Currently, videos must be uploaded one at a time.
+Not currently. Complete one upload before starting the next.
 
-### Q: How long do share links last?
+### Does the video pass through the EC2 server?
 
-**A:** Share links expire after 30 days. You can regenerate a link by setting the video back to "Shared" visibility.
+No. After the server authorises the upload, the browser sends each video part directly to private S3 using temporary presigned URLs.
 
-### Q: Can someone with a share link download my video?
+### Can an interrupted upload resume after closing the browser?
 
-**A:** Only if you have enabled "Allow Download" for that video.
+Not yet. Individual parts retry automatically while the page remains open, but a closed or refreshed page requires a new upload.
 
-### Q: Why did my video stop playing?
+### Can someone with a share link download the video?
 
-**A:** Playback links expire after a period of time for security. Simply refresh the page to resume watching.
+Only when **Allow Download** is enabled.
 
-### Q: Can I change my password?
+### Why did playback stop?
 
-**A:** Contact your administrator to have your password reset.
+The temporary playback URL may have expired. Refresh the page.
 
-### Q: What happens to my videos if my account is deactivated?
+### Is there a limit on the number of videos?
 
-**A:** Your videos remain stored but are not accessible until your account is reactivated by an administrator.
-
-### Q: Is there a limit to how many videos I can upload?
-
-**A:** There is no enforced limit on the number of videos. However, individual files cannot exceed 2 GB.
+The application does not impose a count limit, although S3 storage and transfer charges still apply.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| Cannot log in | Verify your email and password. Contact your admin if your account may be deactivated. |
-| Upload fails | Check that your file is a supported format and under 2 GB. Ensure you have a stable internet connection. |
-| Video won't play | Refresh the page to get a new playback link. Try a different browser if the issue persists. |
-| Share link returns "expired" | The link has passed its 30-day expiry. Ask the video owner to regenerate the share link. |
-| "Permission denied" error | You may be trying to access a private video that isn't yours. Contact the video owner. |
-| Page shows "500 error" | An internal error occurred. Try again later or contact your administrator. |
+| Problem | Suggested action |
+|---|---|
+| Cannot log in | Check the email and password; ask the administrator whether the account is active |
+| Upload rejected immediately | Confirm the extension is supported and the file is within the displayed limit |
+| Upload reports a CORS or missing ETag error | Send the exact message and application URL to the administrator; the S3 CORS origin or exposed headers may be wrong |
+| Upload repeatedly fails on one part | Check network stability and retry; the application automatically attempts each part three times |
+| Browser was closed during upload | Start a new upload; incomplete S3 parts are cleaned up by cancellation or the bucket lifecycle rule |
+| Upload reaches 100% and pauses | Wait while S3 completes the multipart object and the application records metadata |
+| Video will not play | Refresh the page to generate a new playback URL |
+| Share link is expired | Ask the owner to generate a new Shared link |
+| 500 error | Record the time and action, then contact the administrator |
 
 ---
 
-## Need Help?
-
-If you encounter issues not covered in this guide, please reach out to your system administrator for assistance.
-
----
-
-*Badminton Video Vault — Store, organize, and share your badminton journey.* 🏸
+*Badminton Video Vault — Store, organise, and share your badminton journey.*
