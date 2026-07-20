@@ -5,53 +5,61 @@
 <div class="row justify-content-center">
   <div class="col-lg-7">
     <h2 class="mb-1"><i class="bi bi-cloud-upload me-2 text-primary"></i>Upload Video</h2>
-    <p class="text-muted mb-4">Upload a badminton session video to your vault.</p>
+    <p class="text-muted mb-3">Upload a badminton session video to your vault.</p>
+
+    <div class="alert alert-info d-flex align-items-start gap-2" role="alert">
+      <i class="bi bi-cloud-arrow-up-fill mt-1"></i>
+      <div>
+        <strong>Direct-to-S3 upload:</strong> your browser sends video parts
+        straight to the private S3 bucket. The EC2 server coordinates the upload
+        and stores only the video metadata.
+      </div>
+    </div>
 
     <div class="card shadow-sm">
       <div class="card-body p-4">
-        <form method="POST" enctype="multipart/form-data" novalidate id="uploadForm">
+        <div id="uploadError" class="alert alert-danger d-none" role="alert"></div>
+
+        <form
+          method="POST"
+          id="uploadForm"
+          data-initiate-url="{{ url_for('multipart_upload_initiate') }}"
+          data-complete-url="{{ url_for('multipart_upload_complete') }}"
+          data-abort-url="{{ url_for('multipart_upload_abort') }}"
+          data-max-file-size="{{ max_video_file_size }}"
+          data-upload-concurrency="{{ multipart_upload_concurrency }}"
+        >
           {{ form.hidden_tag() }}
 
           <div class="mb-3">
             {{ form.video_file.label(class="form-label fw-semibold") }}
-            {{ form.video_file(class="form-control" + (" is-invalid" if form.video_file.errors else ""), accept="video/*") }}
-            {% for error in form.video_file.errors %}
-              <div class="invalid-feedback">{{ error }}</div>
-            {% endfor %}
-            <div class="form-text">Supported formats: MP4, MOV, AVI, MKV, etc.</div>
+            {{ form.video_file(class="form-control", accept=".mp4,.avi,.mov,.mkv,.webm,video/*") }}
+            <div class="invalid-feedback">Choose an MP4, AVI, MOV, MKV, or WebM file.</div>
+            <div class="form-text">
+              Maximum file size: {{ "%.1f"|format(max_video_file_size / 1024 / 1024 / 1024) }} GiB.
+              Keep this page open until completion.
+            </div>
           </div>
 
           <div class="mb-3">
             {{ form.session_date.label(class="form-label fw-semibold") }}
-            {{ form.session_date(class="form-control" + (" is-invalid" if form.session_date.errors else "")) }}
-            {% for error in form.session_date.errors %}
-              <div class="invalid-feedback">{{ error }}</div>
-            {% endfor %}
+            {{ form.session_date(class="form-control") }}
           </div>
 
           <div class="mb-3">
             {{ form.notes.label(class="form-label fw-semibold") }}
-            {{ form.notes(class="form-control" + (" is-invalid" if form.notes.errors else ""), rows=3, placeholder="Add notes about this session...") }}
-            {% for error in form.notes.errors %}
-              <div class="invalid-feedback">{{ error }}</div>
-            {% endfor %}
+            {{ form.notes(class="form-control", rows=3, maxlength=2000, placeholder="Add notes about this session...") }}
           </div>
 
           <div class="mb-3">
             {{ form.tags.label(class="form-label fw-semibold") }}
-            {{ form.tags(class="form-control" + (" is-invalid" if form.tags.errors else ""), placeholder="e.g. singles, tournament, training") }}
-            {% for error in form.tags.errors %}
-              <div class="invalid-feedback">{{ error }}</div>
-            {% endfor %}
+            {{ form.tags(class="form-control", maxlength=500, placeholder="e.g. singles, tournament, training") }}
             <div class="form-text">Separate tags with commas.</div>
           </div>
 
           <div class="mb-3">
             {{ form.visibility.label(class="form-label fw-semibold") }}
-            {{ form.visibility(class="form-select" + (" is-invalid" if form.visibility.errors else "")) }}
-            {% for error in form.visibility.errors %}
-              <div class="invalid-feedback">{{ error }}</div>
-            {% endfor %}
+            {{ form.visibility(class="form-select") }}
           </div>
 
           <div class="mb-4 form-check">
@@ -59,15 +67,22 @@
             {{ form.allow_download.label(class="form-check-label") }}
           </div>
 
-          <div id="uploadProgress" class="mb-3 d-none">
-            <div class="progress">
-              <div class="progress-bar progress-bar-striped progress-bar-animated" style="width:100%">Uploading…</div>
+          <div id="uploadProgress" class="mb-3 d-none" aria-live="polite">
+            <div class="d-flex justify-content-between small mb-1">
+              <span id="uploadStatus">Preparing upload…</span>
+              <span id="uploadPercent">0%</span>
+            </div>
+            <div class="progress" role="progressbar" aria-label="Video upload progress" aria-valuemin="0" aria-valuemax="100">
+              <div id="uploadProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width: 0%" aria-valuenow="0"></div>
             </div>
           </div>
 
-          <div class="d-flex gap-2">
+          <div class="d-flex flex-wrap gap-2">
             {{ form.submit(class="btn btn-primary", id="submitBtn") }}
-            <a href="{{ url_for('videos') }}" class="btn btn-outline-secondary">Cancel</a>
+            <button type="button" class="btn btn-outline-danger d-none" id="cancelUploadBtn">
+              Cancel Upload
+            </button>
+            <a href="{{ url_for('videos') }}" class="btn btn-outline-secondary" id="leavePageBtn">Back to Videos</a>
           </div>
         </form>
       </div>
@@ -77,11 +92,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
-  document.getElementById('uploadForm').addEventListener('submit', function() {
-    document.getElementById('uploadProgress').classList.remove('d-none');
-    document.getElementById('submitBtn').disabled = true;
-    document.getElementById('submitBtn').textContent = 'Uploading…';
-  });
-</script>
+<script src="{{ url_for('static', filename='upload.js') }}"></script>
 {% endblock %}
