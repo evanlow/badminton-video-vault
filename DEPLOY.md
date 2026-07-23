@@ -1,8 +1,62 @@
 # Deploying Badminton Video Vault to AWS
 
-This guide deploys the application to one Ubuntu EC2 instance with Nginx, Gunicorn, SQLite, a private S3 bucket, an EC2 IAM role, and direct browser-to-S3 multipart uploads.
+This guide deploys Badminton Video Vault to a single Ubuntu EC2 instance using:
 
-> **Important:** Video bytes do not pass through EC2. Flask authorises and completes the upload, while the browser sends the parts directly to S3. This avoids consuming EC2 RAM, `/tmp`, root-volume space, and video-path network bandwidth.
+- **Nginx** as the public web server
+- **Gunicorn** to run the Flask application
+- **SQLite** for application data
+- a **private Amazon S3 bucket** for videos
+- an **EC2 IAM role** instead of permanent AWS access keys
+- **direct browser-to-S3 multipart uploads**
+- an optional custom domain with **HTTPS from Let's Encrypt**
+
+> **Important:** Video bytes do not pass through EC2. Flask authorises and completes each upload, while the browser sends video parts directly to S3. This avoids consuming EC2 RAM, temporary disk space, root-volume space, and EC2 video-path bandwidth.
+
+---
+
+## Read This First
+
+This is a long guide because it includes the AWS console steps, Linux commands, domain setup, verification checkpoints, and troubleshooting.
+
+Work through it in order. At every **Checkpoint**, stop and confirm the expected result before continuing.
+
+### Deployment progress checklist
+
+- [ ] S3 bucket created
+- [ ] S3 IAM policy created
+- [ ] EC2 IAM role created and attached
+- [ ] EC2 instance running
+- [ ] Elastic IP allocated and associated
+- [ ] Application opens through the Elastic IP over HTTP
+- [ ] DNS A record points the chosen hostname to the Elastic IP
+- [ ] Nginx recognises the hostname
+- [ ] HTTPS certificate installed
+- [ ] `APP_BASE_URL` updated to the HTTPS domain
+- [ ] S3 CORS updated to the HTTPS origin
+- [ ] Small MP4 upload tested successfully
+- [ ] Certificate renewal test passed
+
+### Values worksheet
+
+Record your own values here before starting. Use the same values consistently throughout the guide.
+
+| Item | Your value | Example |
+|---|---|---|
+| AWS Region |  | `ap-southeast-1` |
+| S3 bucket name |  | `my-badminton-video-vault` |
+| EC2 instance name |  | `badminton-video-vault-evan` |
+| EC2 key pair file |  | `badminton-vault-key.pem` |
+| IAM policy name |  | `BadmintonVideoVaultS3Policy` |
+| IAM role name |  | `BadmintonVideoVaultEC2Role` |
+| Elastic IP |  | `203.0.113.10` |
+| Root domain |  | `badmintonvideo.com` |
+| Subdomain/host |  | `evan` |
+| Full hostname |  | `evan.badmintonvideo.com` |
+| Final application URL |  | `https://evan.badmintonvideo.com` |
+
+`203.0.113.10` is a documentation-only example address. Replace it with the Elastic IP allocated in your AWS account.
+
+---
 
 ## Architecture
 
@@ -26,27 +80,48 @@ The S3 bucket remains private. Upload, playback, and download use temporary pres
 
 ---
 
+# Part A — AWS Storage and Permissions
+
 ## 1. Create the S3 Bucket
 
-In **Amazon S3 → Create bucket**, configure:
+1. Sign in to the AWS Console.
+2. Confirm the selected region in the top-right corner.
+3. Open **Amazon S3**.
+4. Choose **Create bucket**.
+5. Configure:
 
 | Setting | Value |
 |---|---|
 | Bucket name | A globally unique name |
-| Region | The region closest to users |
+| AWS Region | The same region used by EC2 |
 | Object Ownership | ACLs disabled |
 | Block Public Access | Block all public access |
+| Bucket Versioning | Optional |
 | Default encryption | **SSE-S3**, recommended for this guide |
 
-Record the exact bucket name and region.
+6. Choose **Create bucket**.
+7. Record the exact bucket name and region in the worksheet.
 
 > Using SSE-KMS is possible, but it requires additional KMS key-policy and IAM permissions such as `kms:GenerateDataKey` and `kms:Decrypt`. Do not select SSE-KMS unless those grants are configured for the EC2 role.
+
+### Checkpoint 1
+
+Open the bucket and confirm:
+
+- **Block all public access** is enabled.
+- The bucket is in the intended region.
+- You know its exact name, including hyphens and spelling.
 
 ---
 
 ## 2. Create the S3 IAM Policy
 
-Open **IAM → Policies → Create policy → JSON**:
+This policy allows the application to upload, play, download, and delete objects without making the bucket public.
+
+1. Open **IAM → Policies**.
+2. Choose **Create policy**.
+3. Select the **JSON** editor.
+4. Replace the editor contents with:
 
 ```json
 {
@@ -68,34 +143,60 @@ Open **IAM → Policies → Create policy → JSON**:
 }
 ```
 
-Replace `YOUR-BUCKET-NAME` and save it as:
+5. Replace `YOUR-BUCKET-NAME` with the exact bucket name.
+6. Choose **Next** or **Review and create**.
+7. Enter a policy name such as:
 
 ```text
 BadmintonVideoVaultS3Policy
 ```
 
-S3 authorises multipart creation, part upload, and completion through `s3:PutObject`. `s3:GetObject` also permits the post-completion `HeadObject` verification used by the application.
+A user or role may have more than one policy. Creating this policy does not prevent other policies from being attached.
+
+### Checkpoint 2
+
+Open the new policy and confirm that the resource ends in:
+
+```text
+arn:aws:s3:::YOUR-ACTUAL-BUCKET-NAME/*
+```
+
+The final `/*` is required because the application works with objects inside the bucket.
 
 ---
 
 ## 3. Create and Attach the EC2 IAM Role
 
-1. Open **IAM → Roles → Create role**.
-2. Trusted entity: **AWS service**.
-3. Use case: **EC2**.
-4. Attach `BadmintonVideoVaultS3Policy`.
-5. Name it `BadmintonVideoVaultEC2Role`.
+The IAM role lets EC2 obtain temporary credentials automatically. Do not place permanent AWS access keys in the production `.env` file.
 
-Attach it during EC2 launch under **Advanced details → IAM instance profile**.
+### Create the role
 
-For an existing instance:
+1. Open **IAM → Roles**.
+2. Choose **Create role**.
+3. Trusted entity type: **AWS service**.
+4. Service or use case: **EC2**.
+5. Choose **Next**.
+6. Search for and select `BadmintonVideoVaultS3Policy`.
+7. Choose **Next**.
+8. Name the role:
+
+```text
+BadmintonVideoVaultEC2Role
+```
+
+9. Choose **Create role**.
+
+### Attach the role to an existing EC2 instance
 
 1. Open **EC2 → Instances**.
-2. Select the instance.
+2. Select the badminton vault instance.
 3. Choose **Actions → Security → Modify IAM role**.
 4. Select `BadmintonVideoVaultEC2Role`.
+5. Choose **Update IAM role**.
 
-When using the role, do not put these in production `.env`:
+For a new EC2 instance, select the role under **Advanced details → IAM instance profile** during launch.
+
+Do not put these variables in the production `.env` when the EC2 role is attached:
 
 ```text
 AWS_ACCESS_KEY_ID
@@ -104,13 +205,99 @@ AWS_SECRET_ACCESS_KEY
 
 ---
 
-## 4. Configure Required S3 CORS
+# Part B — EC2 and a Stable Public Address
 
-Direct browser uploads require an exact-origin CORS rule and exposed `ETag` headers.
+## 4. Launch or Prepare the EC2 Instance
 
-Open **S3 → bucket → Permissions → Cross-origin resource sharing (CORS)**.
+Recommended AMI:
 
-For initial HTTP testing:
+```text
+Ubuntu Server 22.04 LTS or 24.04 LTS, 64-bit x86
+```
+
+Suggested starting points:
+
+| Workload | Instance |
+|---|---|
+| Personal or small team | `t3.micro`, one Gunicorn worker |
+| More concurrent page/API requests | At least 2 GiB RAM, such as `t3.small` |
+| Multiple application instances | Larger instance plus an external database |
+
+Use a 20 GiB encrypted gp3 root volume as a comfortable baseline.
+
+### Security group inbound rules
+
+| Type | Port | Source |
+|---|---:|---|
+| SSH | 22 | Your public IP `/32` |
+| HTTP | 80 | `0.0.0.0/0`, optionally `::/0` |
+| HTTPS | 443 | `0.0.0.0/0`, optionally `::/0` |
+
+Do not open port 5000. Avoid leaving SSH open to `0.0.0.0/0`.
+
+---
+
+## 5. Allocate and Associate an Elastic IP
+
+A normal EC2 public IPv4 address can change after the instance is stopped and started. DNS must point to a stable address, so allocate an Elastic IP before configuring the domain.
+
+Public IPv4 addresses may be billed. Check current AWS pricing.
+
+### 5.1 Allocate the Elastic IP
+
+1. Open **EC2**.
+2. In the left menu, open **Network & Security → Elastic IPs**.
+3. Choose **Allocate Elastic IP address**.
+4. Leave the Amazon IPv4 pool and network border group at their defaults unless you have a specific requirement.
+5. Choose **Allocate**.
+6. Optionally add a descriptive **Name** tag, for example:
+
+```text
+badminton-video-vault-evan
+```
+
+At this point the address exists in your AWS account, but it is not yet connected to the instance.
+
+### 5.2 Associate the Elastic IP with EC2
+
+1. Select the newly allocated Elastic IP.
+2. Choose **Actions → Associate Elastic IP address**.
+3. Resource type: **Instance**.
+4. Select the correct badminton vault EC2 instance.
+5. Select its primary private IPv4 address.
+6. Choose **Associate**.
+
+The instance's ordinary public IP will be replaced by the Elastic IP. This is expected.
+
+### 5.3 Confirm the association
+
+Open **EC2 → Instances** and select the instance. Confirm that:
+
+- **Public IPv4 address** equals the Elastic IP.
+- **Elastic IP address** shows the same value.
+- The instance is **Running**.
+- Status checks have passed.
+
+### Checkpoint 3
+
+Open the application using the Elastic IP:
+
+```text
+http://YOUR_ELASTIC_IP/login
+```
+
+Do not configure DNS until the login page works through the Elastic IP.
+
+---
+
+## 6. Configure Initial S3 CORS for HTTP Testing
+
+The browser sends video parts directly to S3. S3 therefore needs an exact-origin CORS rule and must expose the upload `ETag` response header.
+
+1. Open **S3 → your bucket → Permissions**.
+2. Scroll to **Cross-origin resource sharing (CORS)**.
+3. Choose **Edit**.
+4. Use this during initial HTTP testing:
 
 ```json
 [
@@ -124,83 +311,57 @@ For initial HTTP testing:
 ]
 ```
 
-After HTTPS is working:
-
-```json
-[
-  {
-    "AllowedHeaders": ["*"],
-    "AllowedMethods": ["GET", "PUT"],
-    "AllowedOrigins": ["https://vault.example.com"],
-    "ExposeHeaders": ["ETag"],
-    "MaxAgeSeconds": 3600
-  }
-]
-```
-
-During migration, list both exact origins. Do not include trailing slashes. Add every actual frontend origin separately, for example apex and `www` when both are used. Do not use `"*"` for `AllowedOrigins` on a private production vault.
+Do not add a trailing slash to the origin.
 
 ### Delete abandoned multipart uploads
 
-Open **S3 → bucket → Management → Create lifecycle rule** and configure:
+1. Open **S3 → your bucket → Management**.
+2. Choose **Create lifecycle rule**.
+3. Configure it to delete incomplete multipart uploads after 7 days.
 
-```text
-Delete incomplete multipart uploads after 7 days
-```
-
-The UI attempts to abort cancelled and failed uploads, while the lifecycle rule handles closed tabs, dead batteries, and network loss.
+The application attempts to abort cancelled or failed uploads. The lifecycle rule handles closed tabs, dead batteries, and network loss.
 
 ---
 
-## 5. Launch or Prepare EC2
+# Part C — Install and Run the Application
 
-Recommended AMI:
+## 7. Connect to Ubuntu
 
-```text
-Ubuntu Server 22.04 LTS or 24.04 LTS, 64-bit x86
-```
+### Option A — EC2 Instance Connect in the browser
 
-Suggested starting points:
+1. Open **EC2 → Instances**.
+2. Select the instance.
+3. Choose **Connect**.
+4. Choose **EC2 Instance Connect**.
+5. Confirm the username is `ubuntu`.
+6. Choose **Connect**.
 
-| Workload | Instance |
-|---|---|
-| Personal or small team | `t2.micro` or `t3.micro`, one Gunicorn worker |
-| More concurrent page/API requests | At least 2 GiB RAM, such as `t3.small` |
-| Multiple app instances | Larger instance plus an external database |
+### Option B — SSH
 
-Direct S3 upload means a 2 GiB video does not require 2 GiB of EC2 RAM or temporary disk.
-
-Use a 20 GiB encrypted gp3 root volume as a comfortable baseline.
-
-Security-group inbound rules:
-
-| Type | Port | Source |
-|---|---:|---|
-| SSH | 22 | Your public IP `/32` |
-| HTTP | 80 | `0.0.0.0/0`, optionally `::/0` |
-| HTTPS | 443 | `0.0.0.0/0`, optionally `::/0` |
-
-Do not open port 5000. Avoid leaving SSH open to `0.0.0.0/0`.
-
-Allocate and associate an Elastic IP so the public address remains stable. Public IPv4 may be billed.
-
----
-
-## 6. Prepare Ubuntu
-
-Connect:
+macOS or Linux:
 
 ```bash
 ssh -i ~/.ssh/badminton-vault-key.pem ubuntu@YOUR_ELASTIC_IP
 ```
 
-Windows PowerShell example:
+Windows PowerShell:
 
 ```powershell
 ssh -i "$HOME\.ssh\badminton-vault-key.pem" ubuntu@YOUR_ELASTIC_IP
 ```
 
-Refresh package metadata before installing:
+If SSH times out, check that:
+
+- the instance is running;
+- the Elastic IP is associated with the correct instance;
+- port 22 is allowed from your current public IP;
+- you are using the correct key pair and username.
+
+---
+
+## 8. Prepare Ubuntu
+
+Refresh package metadata and install dependencies:
 
 ```bash
 sudo apt update
@@ -241,7 +402,11 @@ aws --version
 aws sts get-caller-identity
 ```
 
-Do not run `aws configure` with an EC2 role. The ARN should contain `assumed-role/BadmintonVideoVaultEC2Role/`.
+Do not run `aws configure` when using the EC2 role. The returned ARN should contain:
+
+```text
+assumed-role/BadmintonVideoVaultEC2Role/
+```
 
 ### Optional swap on a 1 GiB instance
 
@@ -258,9 +423,9 @@ free -h
 swapon --show
 ```
 
-Swap is optional for direct uploads. Regular swap use under ordinary traffic means the instance should be resized.
+Regular swap use under normal traffic means the instance should be resized.
 
-Create an empty destination:
+Create the application destination:
 
 ```bash
 sudo mkdir -p /srv/badminton-video-vault
@@ -268,11 +433,11 @@ sudo chown ubuntu:ubuntu /srv/badminton-video-vault
 ls -la /srv/badminton-video-vault
 ```
 
-Do not create `data/` before cloning.
+Do not create `data/` before cloning into this destination.
 
 ---
 
-## 7. Clone and Configure the Application
+## 9. Clone and Configure the Application
 
 ### Public repository
 
@@ -297,17 +462,17 @@ cat ~/.ssh/deploy_key.pub
 
 Add the public key under **GitHub repository → Settings → Deploy keys**, without write access.
 
-Append the host block only when it is not already present; do not overwrite unrelated SSH configuration:
+Append a GitHub host block without overwriting unrelated SSH configuration:
 
 ```bash
 touch ~/.ssh/config
 chmod 600 ~/.ssh/config
 
-grep -q '^Host github.com$' ~/.ssh/config || cat >> ~/.ssh/config <<'EOF'
+grep -q '^Host github.com$' ~/.ssh/config || cat >> ~/.ssh/config <<'KEYEOF'
 Host github.com
   IdentityFile ~/.ssh/deploy_key
   IdentitiesOnly yes
-EOF
+KEYEOF
 
 git clone git@github.com:YOUR_GITHUB_USERNAME/badminton-video-vault.git \
   /srv/badminton-video-vault
@@ -324,14 +489,21 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Create `.env`
+### Create the production `.env`
+
+Generate a secret:
 
 ```bash
 python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Open the environment file:
+
+```bash
 nano /srv/badminton-video-vault/.env
 ```
 
-Use:
+Use the following as a starting point:
 
 ```ini
 FLASK_SECRET_KEY=PASTE_A_LONG_RANDOM_VALUE
@@ -342,7 +514,6 @@ DATABASE_URL=sqlite:////srv/badminton-video-vault/data/badminton_vault.db
 
 AWS_REGION=YOUR_BUCKET_REGION
 S3_BUCKET_NAME=YOUR_EXACT_BUCKET_NAME
-
 PRESIGNED_URL_EXPIRY=3600
 
 MAX_VIDEO_FILE_SIZE=2147483648
@@ -352,20 +523,20 @@ S3_MULTIPART_URL_EXPIRY=7200
 S3_MULTIPART_TOKEN_MAX_AGE=21600
 S3_MULTIPART_CONCURRENCY=3
 
+# Temporary value until the custom domain and HTTPS are ready.
 APP_BASE_URL=http://YOUR_ELASTIC_IP
 
+# Keep email suppressed until Mailgun is configured and tested.
 MAIL_SUPPRESS_SEND=true
 MAILGUN_TEST_MODE=false
 MAILGUN_TIMEOUT_SECONDS=10
+
+PASSWORD_RESET_TOKEN_TTL_MINUTES=30
+MAGIC_LOGIN_TOKEN_TTL_MINUTES=15
+AUTH_EMAIL_COOLDOWN_SECONDS=60
 ```
 
-Notes:
-
-- `MAX_VIDEO_FILE_SIZE` controls selectable video size.
-- `MAX_REQUEST_BODY_SIZE` remains small because Flask receives JSON only.
-- S3 parts must be at least 5 MiB except the final part.
-- Increase `S3_MULTIPART_URL_EXPIRY` for very slow upload connections.
-- Do not add access-key variables when the instance role is attached.
+Do not add AWS access-key variables when the EC2 IAM role is attached.
 
 Protect the file:
 
@@ -373,7 +544,7 @@ Protect the file:
 chmod 600 /srv/badminton-video-vault/.env
 ```
 
-Initialise:
+Initialise the database and create the first administrator:
 
 ```bash
 cd /srv/badminton-video-vault
@@ -382,9 +553,7 @@ flask init-db
 flask create-admin
 ```
 
-No database schema migration is required when upgrading from the earlier server-upload implementation.
-
-Manual smoke test:
+### Manual application test
 
 ```bash
 gunicorn --bind 127.0.0.1:5000 --workers 1 app:app
@@ -396,13 +565,19 @@ In another session:
 curl -i http://127.0.0.1:5000/login
 ```
 
-Expect `HTTP/1.1 200 OK`, then stop Gunicorn with `Ctrl+C`.
+Expect `HTTP/1.1 200 OK`, then stop the manual Gunicorn process with `Ctrl+C`.
 
 ---
 
-## 8. Configure Gunicorn and systemd
+## 10. Configure Gunicorn and systemd
 
-Create `/etc/systemd/system/badminton-vault.service`:
+Create the service file:
+
+```bash
+sudo nano /etc/systemd/system/badminton-vault.service
+```
+
+Paste:
 
 ```ini
 [Unit]
@@ -437,8 +612,6 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-The old 20-minute upload timeout is unnecessary because video bytes bypass Gunicorn. `RuntimeDirectory=` prevents permission errors from trying to create a socket directly under `/run`.
-
 Start and verify:
 
 ```bash
@@ -450,10 +623,16 @@ sudo systemctl status badminton-vault --no-pager -l
 ls -l /run/badminton-vault/
 ```
 
+The status should show:
+
+```text
+active (running)
+```
+
 Configure log rotation:
 
 ```bash
-sudo tee /etc/logrotate.d/badminton-vault > /dev/null <<'EOF'
+sudo tee /etc/logrotate.d/badminton-vault > /dev/null <<'LOGEOF'
 /var/log/badminton-vault/*.log {
     weekly
     rotate 8
@@ -463,14 +642,20 @@ sudo tee /etc/logrotate.d/badminton-vault > /dev/null <<'EOF'
     notifempty
     copytruncate
 }
-EOF
+LOGEOF
 ```
 
 ---
 
-## 9. Configure Nginx
+## 11. Configure Nginx for Initial HTTP Access
 
-Create `/etc/nginx/sites-available/badminton-vault`:
+Create the site configuration:
+
+```bash
+sudo nano /etc/nginx/sites-available/badminton-vault
+```
+
+Paste:
 
 ```nginx
 server {
@@ -494,196 +679,200 @@ server {
 }
 ```
 
-Enable it and remove Ubuntu's default site:
+Enable the site and remove Ubuntu's default site:
 
 ```bash
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo ln -sf \
   /etc/nginx/sites-available/badminton-vault \
   /etc/nginx/sites-enabled/badminton-vault
+
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-Test:
+Test locally:
 
 ```bash
 curl -i http://127.0.0.1/login
 ```
 
-Browse to `http://YOUR_ELASTIC_IP`.
+Then open:
+
+```text
+http://YOUR_ELASTIC_IP/login
+```
+
+### Checkpoint 4
+
+Do not begin domain or HTTPS setup until the application opens through the Elastic IP.
 
 ---
 
-## 10. Domain and HTTPS
+# Part D — Custom Domain and HTTPS
 
-This section connects a human-readable domain to the application and then enables HTTPS:
+## 12. Beginner-Friendly Domain and HTTPS Walkthrough
+
+This section connects a hostname such as `evan.badmintonvideo.com` to the EC2 application and then enables HTTPS.
 
 ```text
-vault.example.com
-        |  DNS A record
-        v
+evan.badmintonvideo.com
+          |  DNS A record
+          v
 EC2 Elastic IP
-        |  ports 80 and 443
-        v
+          |  ports 80 and 443
+          v
 Nginx -> Gunicorn -> Flask
 
-Browser video PUT requests -------------------------> Private S3 bucket
+Browser video PUT requests --------------------------> Private S3 bucket
 ```
 
-`vault.example.com` is only a placeholder. Replace it everywhere below with the exact hostname you control, such as `vault.mybadmintonclub.com`. Do not literally configure `example.com`.
+The setup spans three places:
 
-The domain setup spans three places:
+1. **AWS EC2** provides the stable Elastic IP and permits ports 80/443.
+2. **Your DNS provider** points the hostname to the Elastic IP.
+3. **The EC2 server** configures Nginx and obtains a TLS certificate.
+4. **The S3 bucket** permits direct uploads from the final HTTPS origin.
 
-1. **Your DNS provider** points the hostname to the EC2 Elastic IP.
-2. **The EC2 server** configures Nginx and obtains a TLS certificate with Certbot.
-3. **The S3 bucket** permits direct browser uploads from the new HTTPS origin.
+Follow the checkpoints in order. Do not jump directly to Certbot.
 
-### 10.1 Before you begin
+---
 
-Confirm all of the following before changing DNS:
+### 12.1 Choose the Exact Hostname
 
-- You own a domain and can edit its DNS records.
-- The application currently opens at `http://YOUR_ELASTIC_IP`.
+A dedicated subdomain is normally easiest and is less likely to interfere with an existing website or email configuration.
+
+Example:
+
+```text
+Root domain: badmintonvideo.com
+Host/name:   evan
+Full name:   evan.badmintonvideo.com
+Final URL:   https://evan.badmintonvideo.com
+```
+
+Use only the hostname in DNS and Nginx:
+
+```text
+evan.badmintonvideo.com
+```
+
+Do not enter any of these as a hostname:
+
+```text
+https://evan.badmintonvideo.com
+evan.badmintonvideo.com/login
+evan.badmintonvideo.com/
+evan.badmintonvideo.com:5000
+```
+
+---
+
+### 12.2 Confirm the AWS Prerequisites
+
+Before changing DNS, confirm all of the following:
+
+- The application opens at `http://YOUR_ELASTIC_IP/login`.
 - The Elastic IP is associated with the correct EC2 instance.
-- The EC2 security group permits inbound HTTP on port 80 and HTTPS on port 443.
-- SSH on port 22 remains restricted to your public IP or another trusted source.
-- Port 5000 is not exposed publicly.
+- The EC2 security group permits inbound HTTP on port 80.
+- The EC2 security group permits inbound HTTPS on port 443.
+- SSH on port 22 is restricted to your trusted source.
+- Port 5000 is not publicly exposed.
+- Nginx and the application service are running.
 
-From the EC2 server, verify the current HTTP deployment:
+From EC2:
 
 ```bash
 curl -i http://127.0.0.1/login
-curl -I http://YOUR_ELASTIC_IP/login
+sudo systemctl status nginx --no-pager -l
+sudo systemctl status badminton-vault --no-pager -l
 ```
 
-Fix the EC2, Gunicorn, or Nginx deployment before continuing if these checks fail.
+Fix any failure before continuing.
 
-### 10.2 Choose the exact hostname
+---
 
-A subdomain is usually the simplest option:
+### 12.3 Create the DNS A Record
 
-```text
-vault.example.com
-```
+Sign in to the company that manages DNS for the root domain. This may be WHOIS/MyOrderBox, Route 53, Cloudflare, GoDaddy, Namecheap, Squarespace Domains, or another provider.
 
-For a domain such as `mybadmintonclub.com`, that would be:
-
-```text
-vault.mybadmintonclub.com
-```
-
-Use one exact hostname throughout the initial setup. The hostname must not contain:
-
-- `http://` or `https://`
-- a path such as `/login`
-- a trailing slash
-- a port such as `:5000`
-
-For example, use this in DNS and Nginx:
-
-```text
-vault.mybadmintonclub.com
-```
-
-Do not use this as a hostname:
-
-```text
-https://vault.mybadmintonclub.com/login
-```
-
-Using the root or apex domain, such as `mybadmintonclub.com`, is possible. DNS providers normally represent it with `@` or an empty record name. A dedicated subdomain is less likely to interfere with an existing website or email configuration.
-
-### 10.3 Confirm the Elastic IP and security group
-
-In AWS:
-
-1. Open **EC2 → Network & Security → Elastic IP addresses**.
-2. Select the Elastic IP intended for this application.
-3. Confirm its associated instance is the badminton vault EC2 instance.
-4. Copy the IPv4 address. It will look similar to `203.0.113.10`.
-
-If it is not associated:
-
-1. Select the Elastic IP.
-2. Choose **Actions → Associate Elastic IP address**.
-3. Select the EC2 instance and its primary private IPv4 address.
-4. Choose **Associate**.
-
-Then open the instance's security group and confirm these inbound rules:
-
-| Type | Port | Source |
-|---|---:|---|
-| SSH | 22 | Your public IP `/32` |
-| HTTP | 80 | `0.0.0.0/0`, optionally `::/0` |
-| HTTPS | 443 | `0.0.0.0/0`, optionally `::/0` |
-
-Do not point DNS at the instance's private IPv4 address. Do not point DNS at a temporary public IPv4 address when an Elastic IP has been allocated.
-
-### 10.4 Create the DNS A record
-
-Sign in to the service that manages DNS for the domain. This may be Route 53, Cloudflare, Squarespace Domains, GoDaddy, Namecheap, or another provider.
+Look for **DNS Management**, **Manage DNS**, **Zone Editor**, or **DNS Records**.
 
 Create an IPv4 `A` record:
 
-| DNS field | Example value |
+| DNS field | Enter |
 |---|---|
 | Type | `A` |
-| Name or Host | `vault` |
-| Value, Address, or Points to | `YOUR_ELASTIC_IP` |
-| TTL | `300`, five minutes, or `Auto` |
+| Name, Host, or Record name | Only the subdomain portion, for example `evan` |
+| Destination, Value, Address, or Points to | Your Elastic IP |
+| TTL | `300`, five minutes, or the provider default |
 
-For example:
-
-```text
-Type:   A
-Name:   vault
-Value:  203.0.113.10
-TTL:    Auto
-```
-
-That record means:
+Example:
 
 ```text
-vault.example.com -> 203.0.113.10
+Type:        A
+Name/Host:   evan
+Destination: 203.0.113.10
+TTL:         Auto
 ```
 
-For Amazon Route 53:
+This means:
+
+```text
+evan.badmintonvideo.com -> 203.0.113.10
+```
+
+#### WHOIS/MyOrderBox-style DNS screen
+
+1. Open the domain's **DNS Management** page.
+2. Choose **Manage DNS**.
+3. Open the **A Records** tab.
+4. Choose **Add A Record** or **Add Address A Record**.
+5. Enter only the subdomain label, such as `evan`, in the name field.
+6. Enter the Elastic IP in the destination IP field.
+7. Save.
+8. Confirm the resulting row shows the full hostname, the Elastic IP, and an **Active** status.
+
+#### Amazon Route 53
 
 1. Open **Route 53 → Hosted zones**.
-2. Select the hosted zone for the domain.
+2. Select the hosted zone for the root domain.
 3. Choose **Create record**.
-4. Set **Record name** to `vault`.
+4. Set **Record name** to the subdomain label, such as `evan`.
 5. Set **Record type** to `A`.
 6. Enter the Elastic IP under **Value**.
 7. Use **Simple routing**.
 8. Choose **Create records**.
 
-Important DNS rules:
+#### Important DNS rules
 
-- Enter only the hostname portion requested by the provider. Some providers expect `vault`; others display or expect the full hostname.
-- Do not enter `https://vault.example.com` in an A record.
-- Do not include a path, slash, or port.
-- Do not create a `CNAME` record whose target is an IP address.
-- Do not add an `AAAA` record unless IPv6 has deliberately been configured for the instance, routing, security group, and Nginx.
-- If a DNS provider offers an HTTP proxy or CDN mode, use **DNS only** during initial certificate setup. Re-enable the proxy later only after the direct origin works correctly.
-- Avoid changing unrelated MX, TXT, DKIM, SPF, or other records used by email and existing services.
+- Do not use **Domain Forwarding** for this setup. Use a DNS `A` record.
+- Do not enter `https://` in an A record.
+- Do not include `/login`, a slash, or a port.
+- Do not create a CNAME whose target is an IP address.
+- Do not point DNS to the EC2 private IP address.
+- Do not point DNS to an old temporary public IP.
+- Do not add an `AAAA` record unless IPv6 is deliberately configured end to end.
+- If the DNS provider offers proxy/CDN mode, use **DNS only** until HTTPS works directly.
+- Do not change unrelated MX, TXT, SPF, DKIM, DMARC, or other email records.
 
-### 10.5 Verify DNS resolution
+---
+
+### 12.4 Verify DNS Resolution
 
 Do not continue to Certbot until the hostname resolves publicly to the exact Elastic IP.
 
 From Windows PowerShell:
 
 ```powershell
-nslookup vault.example.com
-Resolve-DnsName vault.example.com -Type A
+nslookup evan.badmintonvideo.com
+Resolve-DnsName evan.badmintonvideo.com -Type A
 ```
 
-From macOS, Linux, or the EC2 instance:
+From macOS, Linux, or EC2:
 
 ```bash
-dig +short A vault.example.com
+dig +short A evan.badmintonvideo.com
 ```
 
 If `dig` is unavailable on Ubuntu:
@@ -691,38 +880,33 @@ If `dig` is unavailable on Ubuntu:
 ```bash
 sudo apt update
 sudo apt install -y dnsutils
-dig +short A vault.example.com
+dig +short A evan.badmintonvideo.com
 ```
 
-The result must be the Elastic IP, for example:
+The result must be your Elastic IP.
 
-```text
-203.0.113.10
-```
-
-If the result is blank or shows another address:
+If the result is blank or incorrect:
 
 1. Recheck the A record name and value.
-2. Confirm the domain is using the nameservers of the DNS provider you edited.
-3. Remove conflicting records for the same hostname.
-4. Allow existing DNS caches to expire according to the previous TTL.
-5. Repeat the lookup until it returns the Elastic IP.
+2. Confirm the root domain uses the nameservers of the DNS provider you edited.
+3. Remove conflicting A or AAAA records for the same hostname.
+4. Wait for DNS caches to expire according to the previous TTL.
+5. Repeat the lookup.
 
-Stop here while DNS is incorrect. Certbot cannot validate a hostname that does not reach this server.
+### Checkpoint 5
 
-### 10.6 Configure Nginx for the hostname
+Confirm both of these before continuing:
 
-Connect to EC2 over SSH if not already connected:
+- `nslookup` or `dig` returns the Elastic IP.
+- `http://YOUR_HOSTNAME/login` opens the correct application.
 
-```bash
-ssh -i ~/.ssh/badminton-vault-key.pem ubuntu@YOUR_ELASTIC_IP
-```
+The browser will still show **Not secure** at this point. That is expected because HTTPS has not been installed yet.
 
-Windows PowerShell example:
+---
 
-```powershell
-ssh -i "$HOME\.ssh\badminton-vault-key.pem" ubuntu@YOUR_ELASTIC_IP
-```
+### 12.5 Configure Nginx for the Hostname
+
+Connect to EC2 using EC2 Instance Connect or SSH.
 
 Back up the working Nginx configuration:
 
@@ -747,20 +931,44 @@ server_name _;
 Replace it with the exact hostname:
 
 ```nginx
-server_name vault.example.com;
+server_name evan.badmintonvideo.com;
 ```
 
-The `server_name` value contains only the hostname. Do not include `https://`, a path, or a trailing slash.
+Do not include `https://`, a path, or a trailing slash.
 
-Save the file, test it, and reload Nginx:
+#### Saving in Nano
+
+Press:
+
+```text
+Ctrl+O
+Enter
+Ctrl+X
+```
+
+Test before reloading:
 
 ```bash
 sudo nginx -t
+```
+
+The expected result includes:
+
+```text
+syntax is ok
+test is successful
+```
+
+Do not reload Nginx if the test reports an error.
+
+After a successful test:
+
+```bash
 sudo systemctl reload nginx
 sudo systemctl status nginx --no-pager -l
 ```
 
-Do not reload Nginx if `sudo nginx -t` reports an error. Correct the indicated file and line first. To restore the backup if necessary:
+To restore the backup if needed:
 
 ```bash
 sudo cp \
@@ -770,25 +978,31 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-### 10.7 Test the domain over HTTP
+---
 
-Test the public hostname before requesting a certificate:
+### 12.6 Test the Hostname over HTTP
+
+From EC2:
 
 ```bash
-curl -I http://vault.example.com/login
+curl -I http://evan.badmintonvideo.com/login
 ```
 
-Also open this address in a browser:
+Also open this in a browser:
 
 ```text
-http://vault.example.com/login
+http://evan.badmintonvideo.com/login
 ```
 
-The login page should be the same application previously reached through the Elastic IP. If the Elastic IP works but the domain does not, recheck DNS, the EC2 security group, and `server_name` before continuing.
+The login page should match the application previously reached through the Elastic IP.
 
-### 10.8 Install Certbot and enable HTTPS
+If the Elastic IP works but the hostname does not, recheck DNS, the security group, and the Nginx `server_name` before continuing.
 
-Install Certbot and its Nginx integration on the EC2 server:
+---
+
+### 12.7 Install Certbot and Enable HTTPS
+
+Install Certbot and its Nginx integration:
 
 ```bash
 sudo apt update
@@ -798,33 +1012,41 @@ sudo apt install -y certbot python3-certbot-nginx
 Request a certificate for the exact hostname:
 
 ```bash
-sudo certbot --nginx -d vault.example.com
+sudo certbot --nginx -d evan.badmintonvideo.com
 ```
 
 During the prompts:
 
-1. Enter an email address used for renewal and security notices.
+1. Enter an email address for renewal and security notices.
 2. Accept the terms of service.
-3. Choose the option that redirects HTTP traffic to HTTPS when offered.
+3. Choose HTTP-to-HTTPS redirection if Certbot offers the option.
 
-Certbot should obtain the certificate and update the Nginx configuration. Then verify Nginx and the certificate:
+A successful result should state that the certificate was received and deployed.
+
+Verify:
 
 ```bash
 sudo nginx -t
 sudo systemctl status nginx --no-pager -l
 sudo certbot certificates
-curl -I https://vault.example.com/login
+curl -I https://evan.badmintonvideo.com/login
 ```
 
-Test automatic renewal without changing the live certificate:
+A normal result may be `200 OK` or an application redirect.
 
-```bash
-sudo certbot renew --dry-run
-```
+If Certbot reports an authorisation or connection failure, do not repeatedly retry. First verify:
 
-The normal HTTP validation must reach this EC2 instance on port 80. If Certbot reports an authorisation or connection error, do not repeatedly retry without first checking the DNS result, Elastic IP association, port 80 security-group rule, Nginx status, and any DNS-provider proxy mode.
+- DNS resolves to the correct Elastic IP.
+- Port 80 is publicly reachable.
+- The Elastic IP is associated with the correct instance.
+- Nginx is running.
+- DNS proxy/CDN mode is disabled during initial setup.
 
-### 10.9 Update the application base URL
+---
+
+### 12.8 Update `APP_BASE_URL`
+
+The application uses `APP_BASE_URL` in password-reset and magic-login links. Replace the temporary IP-based URL with the final HTTPS origin.
 
 Open the production environment file:
 
@@ -832,19 +1054,21 @@ Open the production environment file:
 nano /srv/badminton-video-vault/.env
 ```
 
-Find the temporary HTTP value:
+Find:
 
 ```ini
 APP_BASE_URL=http://YOUR_ELASTIC_IP
 ```
 
-Replace it with the exact HTTPS origin, with no trailing slash:
+Replace it with:
 
 ```ini
-APP_BASE_URL=https://vault.example.com
+APP_BASE_URL=https://evan.badmintonvideo.com
 ```
 
-Save the file and restart the application so Gunicorn loads the new environment value:
+Do not add a trailing slash.
+
+Restart the application:
 
 ```bash
 sudo systemctl restart badminton-vault
@@ -852,19 +1076,45 @@ sleep 3
 sudo systemctl status badminton-vault --no-pager -l
 ```
 
-Confirm the configured value without printing unrelated secrets:
+Confirm only the intended value without printing unrelated secrets:
 
 ```bash
 grep '^APP_BASE_URL=' /srv/badminton-video-vault/.env
 ```
 
-### 10.10 Update the S3 CORS origin
+Expected:
 
-The browser uploads video parts directly to S3, so the S3 bucket must allow the new HTTPS origin.
+```text
+APP_BASE_URL=https://evan.badmintonvideo.com
+```
 
-Open **S3 → bucket → Permissions → Cross-origin resource sharing (CORS)**.
+---
 
-During migration, both the temporary IP address and the new domain may be listed:
+### 12.9 Test Automatic Certificate Renewal
+
+Run a safe simulated renewal:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+The expected result is similar to:
+
+```text
+Congratulations, all simulated renewals succeeded
+```
+
+Certbot normally installs a timer or scheduled task for automatic renewal.
+
+---
+
+### 12.10 Update S3 CORS to the HTTPS Origin
+
+This step is essential. The website can load correctly while direct video uploads still fail if S3 does not allow the new HTTPS origin.
+
+Open **S3 → your bucket → Permissions → Cross-origin resource sharing (CORS)**.
+
+During migration, allow both the temporary HTTP origin and the final HTTPS origin:
 
 ```json
 [
@@ -873,7 +1123,7 @@ During migration, both the temporary IP address and the new domain may be listed
     "AllowedMethods": ["GET", "PUT"],
     "AllowedOrigins": [
       "http://YOUR_ELASTIC_IP",
-      "https://vault.example.com"
+      "https://evan.badmintonvideo.com"
     ],
     "ExposeHeaders": ["ETag"],
     "MaxAgeSeconds": 3600
@@ -881,75 +1131,90 @@ During migration, both the temporary IP address and the new domain may be listed
 ]
 ```
 
-After HTTPS uploads have been tested successfully, remove the temporary HTTP origin:
+After HTTPS uploads work, remove the temporary HTTP origin:
 
 ```json
 [
   {
     "AllowedHeaders": ["*"],
     "AllowedMethods": ["GET", "PUT"],
-    "AllowedOrigins": ["https://vault.example.com"],
+    "AllowedOrigins": ["https://evan.badmintonvideo.com"],
     "ExposeHeaders": ["ETag"],
     "MaxAgeSeconds": 3600
   }
 ]
 ```
 
-The origin must match the browser address exactly:
+The origin must match the browser address exactly and must not have a trailing slash.
 
-```text
-https://vault.example.com
-```
+Do not use `"*"` for `AllowedOrigins` on the private production vault. Updating CORS does not make the bucket public.
 
-Do not add a trailing slash. Do not use `"*"` for `AllowedOrigins` on the private production vault. Updating CORS does not make the bucket public; S3 objects remain protected by Block Public Access and temporary presigned URLs.
+---
 
-### 10.11 Perform the final domain test
+### 12.11 Perform the Final Domain Test
 
 Verify the HTTP-to-HTTPS redirect:
 
 ```bash
-curl -I http://vault.example.com/login
+curl -I http://evan.badmintonvideo.com/login
 ```
-
-The response should redirect to an `https://vault.example.com/...` location.
 
 Verify HTTPS directly:
 
 ```bash
-curl -I https://vault.example.com/login
+curl -I https://evan.badmintonvideo.com/login
 ```
 
-Then use a browser to complete the application test:
+Then test in a browser:
 
-1. Open `https://vault.example.com`.
+1. Open `https://evan.badmintonvideo.com`.
 2. Confirm the browser reports a valid secure connection.
 3. Sign in.
 4. Upload a small MP4 before testing a large file.
-5. In browser developer tools, open **Network**.
-6. Confirm application JSON requests use the HTTPS domain.
+5. Open browser developer tools → **Network**.
+6. Confirm application JSON requests use the HTTPS hostname.
 7. Confirm multipart `PUT` requests go directly to an S3 hostname.
-8. Confirm the video record is created and playback works.
+8. Confirm the video record is created.
+9. Confirm playback and download work.
+10. Test **Cancel Upload** and confirm no video record is created.
 
-After the domain works, use the hostname instead of the Elastic IP for normal access.
+### Checkpoint 6 — Domain Setup Complete
 
-### 10.12 Domain and HTTPS troubleshooting
+The domain setup is complete when all of these are true:
+
+- [ ] DNS resolves to the Elastic IP.
+- [ ] HTTP redirects to HTTPS.
+- [ ] The browser shows a valid secure connection.
+- [ ] Nginx and `badminton-vault` are active.
+- [ ] `APP_BASE_URL` contains the HTTPS hostname.
+- [ ] S3 CORS contains the exact HTTPS origin.
+- [ ] A small MP4 uploads and plays successfully.
+- [ ] `sudo certbot renew --dry-run` succeeds.
+
+Use the hostname instead of the Elastic IP for normal access from now on.
+
+---
+
+### 12.12 Domain and HTTPS Troubleshooting
 
 | Symptom | Checks and fixes |
 |---|---|
-| DNS lookup is blank | Check the record name, active nameservers, and DNS-zone selection; then wait for the previous TTL to expire |
-| DNS lookup returns the wrong IP | Replace the record value with the associated Elastic IP and remove conflicting A records |
+| DNS lookup is blank | Check the record name, active nameservers, and DNS-zone selection; then wait for caches to expire |
+| DNS lookup returns the wrong IP | Replace the record value with the associated Elastic IP and remove conflicting A/AAAA records |
 | Domain times out | Confirm the Elastic IP association, inbound ports 80/443, Nginx status, and any active host firewall |
-| Certbot reports `unauthorized` | Confirm the A record resolves to this EC2 instance, port 80 is reachable, Nginx is running, and proxy/CDN mode is disabled during setup |
+| Domain opens the wrong server | Check for an old A/AAAA record and confirm the Elastic IP is associated with the intended instance |
+| Certbot reports `unauthorized` | Confirm DNS points to this EC2 instance, port 80 is reachable, Nginx is running, and proxy mode is disabled |
 | `sudo nginx -t` fails | Correct the reported syntax error or restore `badminton-vault.before-domain` before reloading |
-| HTTPS returns `502 Bad Gateway` | Check `badminton-vault` service status and the Unix socket under `/run/badminton-vault/` |
-| Browser shows the wrong certificate | Check DNS for old A/AAAA records, inspect `sudo certbot certificates`, and confirm the browser is reaching this server rather than a proxy |
-| Website works but uploads fail with CORS | Add the exact `https://vault.example.com` origin to S3 CORS, preserve `ETag`, and remove any trailing slash |
-| IPv4 works but some clients fail | Remove an unintended AAAA record or fully configure IPv6 through DNS, EC2 networking, the security group, and Nginx |
+| HTTPS returns `502 Bad Gateway` | Check the `badminton-vault` service and the Unix socket under `/run/badminton-vault/` |
+| Browser shows the wrong certificate | Check old DNS records, `sudo certbot certificates`, and whether a proxy is serving another certificate |
+| Website works but uploads fail with CORS | Add the exact HTTPS origin to S3 CORS, preserve `ETag`, and remove any trailing slash |
+| Password-reset email contains the IP | Update `APP_BASE_URL` and restart `badminton-vault` |
+| IPv4 works but some clients fail | Remove an unintended AAAA record or fully configure IPv6 end to end |
 
 Useful diagnostics:
 
 ```bash
-dig +short A vault.example.com
+dig +short A evan.badmintonvideo.com
 sudo nginx -t
 sudo systemctl status nginx --no-pager -l
 sudo systemctl status badminton-vault --no-pager -l
@@ -968,7 +1233,39 @@ sudo ufw status
 
 ---
 
-## 11. Deploy Updates
+# Part E — Operations
+
+## 13. Configure Mailgun Later, If Needed
+
+Keep this setting while outbound email is not ready:
+
+```ini
+MAIL_SUPPRESS_SEND=true
+```
+
+When configuring Mailgun, use values based on `.env.example`, including:
+
+```ini
+MAILGUN_API_KEY=your-mailgun-domain-sending-key
+MAILGUN_DOMAIN=your-verified-mailgun-domain
+MAILGUN_API_BASE_URL=https://api.mailgun.net
+MAIL_FROM="Badminton Video Vault <noreply@your-domain>"
+MAIL_SUPPRESS_SEND=false
+MAILGUN_TEST_MODE=false
+MAILGUN_TIMEOUT_SECONDS=10
+```
+
+Restart the application after changing `.env`:
+
+```bash
+sudo systemctl restart badminton-vault
+```
+
+Do not expose API keys in screenshots, logs, commits, or support messages.
+
+---
+
+## 14. Deploy Application Updates
 
 Manual deployment:
 
@@ -980,7 +1277,7 @@ python -m pip install -r requirements.txt
 sudo systemctl restart badminton-vault
 ```
 
-Verify over the socket:
+Verify through the Unix socket:
 
 ```bash
 curl --fail --silent --show-error \
@@ -989,28 +1286,13 @@ curl --fail --silent --show-error \
   && echo "Application is healthy"
 ```
 
-The included GitHub Actions workflow runs all smoke tests before deployment and uses the correct nested socket path. It requires `EC2_HOST` and `EC2_SSH_KEY` repository secrets. Prefer SSM, a self-hosted runner, or a controlled source IP rather than opening SSH globally only for CI/CD.
+Then verify the public HTTPS URL.
+
+The included GitHub Actions workflow runs smoke tests before deployment and uses the nested socket path. It requires `EC2_HOST` and `EC2_SSH_KEY` repository secrets. Prefer SSM, a self-hosted runner, or a controlled source IP rather than opening SSH globally for CI/CD.
 
 ---
 
-## 12. Verify Direct Multipart Upload
-
-1. Open browser developer tools → **Network**.
-2. Upload a small MP4 first.
-3. Confirm small JSON calls to:
-   - `/api/uploads/multipart/initiate`
-   - `/api/uploads/multipart/complete`
-4. Confirm multiple `PUT` requests go directly to an S3 hostname.
-5. Confirm the object appears under `videos/<user-id>/` in S3.
-6. Confirm the application creates a video record and playback works.
-7. Test **Cancel Upload** and confirm no video record is created.
-8. Test larger files only after the small test succeeds.
-
-During upload, EC2 RAM and disk should remain comparatively steady.
-
----
-
-## Backups and Maintenance
+## 15. Backups and Maintenance
 
 Safe SQLite backup:
 
@@ -1037,32 +1319,32 @@ df -h / /tmp
 
 ---
 
-## Troubleshooting
+## 16. General Troubleshooting
 
 ### S3 and direct upload
 
 | Symptom | Fix |
 |---|---|
-| Browser CORS/network error | Add the exact origin to S3 CORS; no trailing slash |
+| Browser CORS/network error | Add the exact browser origin to S3 CORS; no trailing slash |
 | Missing ETag error | Add `"ExposeHeaders": ["ETag"]` |
-| AccessDenied | Verify EC2 role, bucket ARN, and S3 actions |
-| URLs expire before completion | Increase `S3_MULTIPART_URL_EXPIRY`, restart Gunicorn |
-| File rejected immediately | Check extension and `MAX_VIDEO_FILE_SIZE` |
-| Upload reaches 100% then fails | Inspect Gunicorn log for completion, size, or DB failure |
+| `AccessDenied` | Verify the EC2 role, bucket ARN, and required S3 actions |
+| URLs expire before completion | Increase `S3_MULTIPART_URL_EXPIRY`, then restart Gunicorn |
+| File rejected immediately | Check the extension and `MAX_VIDEO_FILE_SIZE` |
+| Upload reaches 100% then fails | Inspect the Gunicorn log for completion, size, or database failure |
 | Abandoned parts accumulate | Enable the seven-day incomplete-multipart lifecycle rule |
-| 413 during video upload | Latest `static/upload.js` is not loaded, or video was posted to Flask |
+| `413 Request Entity Too Large` | Ensure the latest direct-upload JavaScript is loaded and the video is not being posted to Flask |
 
 ### Gunicorn and Nginx
 
 | Symptom | Fix |
 |---|---|
-| `/run/badminton-vault.sock: Permission denied` | Use `RuntimeDirectory=badminton-vault` and nested socket path |
-| `502 Bad Gateway` | Check service status and socket path |
+| Socket permission error | Use `RuntimeDirectory=badminton-vault` and the nested socket path |
+| `502 Bad Gateway` | Check the service status and socket path |
 | **Welcome to nginx!** | Remove `/etc/nginx/sites-enabled/default` |
-| Generic 500 | Check `/var/log/badminton-vault/error.log` |
-| Worker restart loop | Check systemd, Gunicorn, and kernel OOM logs |
+| Generic 500 error | Check `/var/log/badminton-vault/error.log` |
+| Worker restart loop | Check systemd, Gunicorn, and kernel out-of-memory logs |
 
-OOM diagnostics:
+Out-of-memory diagnostics:
 
 ```bash
 sudo journalctl -k -b | \
@@ -1091,12 +1373,16 @@ aws sts get-caller-identity
 
 - Keep S3 Block Public Access enabled.
 - Restrict S3 CORS to exact application origins.
-- Use an EC2 role instead of static access keys.
+- Use an EC2 IAM role instead of static access keys.
 - Restrict SSH to trusted sources.
 - Keep `.env` mode `600`.
 - Use HTTPS and a strong `FLASK_SECRET_KEY`.
-- The completed S3 object uses the same storage regardless of upload method. The savings are on EC2 RAM, disk, and video-path processing. Incomplete multipart parts consume S3 storage until aborted or removed by lifecycle policy.
-- Check current AWS pricing for S3 requests/transfer, EC2, EBS, snapshots, and public IPv4.
+- Keep the operating system and Python dependencies patched.
+- Do not expose Mailgun keys, Flask secrets, SSH keys, or AWS credentials.
+- Incomplete multipart parts consume S3 storage until aborted or removed by lifecycle policy.
+- Public IPv4 addresses, EC2, EBS, S3 requests, data transfer, snapshots, and backups may incur charges. Check current AWS pricing.
+
+---
 
 ## References
 
