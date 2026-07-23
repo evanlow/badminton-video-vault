@@ -280,13 +280,13 @@ Open **EC2 → Instances** and select the instance. Confirm that:
 
 ### Checkpoint 3
 
-Open the application using the Elastic IP:
+If you are configuring an already-running instance, confirm it still opens over the Elastic IP:
 
 ```text
 http://YOUR_ELASTIC_IP/login
 ```
 
-Do not configure DNS until the login page works through the Elastic IP.
+For a fresh deployment, continue to Part C first, then complete this check at Checkpoint 4.
 
 ---
 
@@ -727,7 +727,7 @@ Nginx -> Gunicorn -> Flask
 Browser video PUT requests --------------------------> Private S3 bucket
 ```
 
-The setup spans three places:
+The setup spans four places:
 
 1. **AWS EC2** provides the stable Elastic IP and permits ports 80/443.
 2. **Your DNS provider** points the hostname to the Elastic IP.
@@ -754,16 +754,16 @@ Final URL:   https://evan.badmintonvideo.com
 Use only the hostname in DNS and Nginx:
 
 ```text
-evan.badmintonvideo.com
+YOUR_HOSTNAME
 ```
 
 Do not enter any of these as a hostname:
 
 ```text
-https://evan.badmintonvideo.com
-evan.badmintonvideo.com/login
-evan.badmintonvideo.com/
-evan.badmintonvideo.com:5000
+https://YOUR_HOSTNAME
+YOUR_HOSTNAME/login
+YOUR_HOSTNAME/
+YOUR_HOSTNAME:5000
 ```
 
 ---
@@ -819,7 +819,7 @@ TTL:         Auto
 This means:
 
 ```text
-evan.badmintonvideo.com -> 203.0.113.10
+YOUR_HOSTNAME -> 203.0.113.10
 ```
 
 #### WHOIS/MyOrderBox-style DNS screen
@@ -865,14 +865,14 @@ Do not continue to Certbot until the hostname resolves publicly to the exact Ela
 From Windows PowerShell:
 
 ```powershell
-nslookup evan.badmintonvideo.com
-Resolve-DnsName evan.badmintonvideo.com -Type A
+nslookup YOUR_HOSTNAME
+Resolve-DnsName YOUR_HOSTNAME -Type A
 ```
 
 From macOS, Linux, or EC2:
 
 ```bash
-dig +short A evan.badmintonvideo.com
+dig +short A YOUR_HOSTNAME
 ```
 
 If `dig` is unavailable on Ubuntu:
@@ -880,7 +880,7 @@ If `dig` is unavailable on Ubuntu:
 ```bash
 sudo apt update
 sudo apt install -y dnsutils
-dig +short A evan.badmintonvideo.com
+dig +short A YOUR_HOSTNAME
 ```
 
 The result must be your Elastic IP.
@@ -931,7 +931,7 @@ server_name _;
 Replace it with the exact hostname:
 
 ```nginx
-server_name evan.badmintonvideo.com;
+server_name YOUR_HOSTNAME;
 ```
 
 Do not include `https://`, a path, or a trailing slash.
@@ -985,13 +985,13 @@ sudo systemctl reload nginx
 From EC2:
 
 ```bash
-curl -I http://evan.badmintonvideo.com/login
+curl -I http://YOUR_HOSTNAME/login
 ```
 
 Also open this in a browser:
 
 ```text
-http://evan.badmintonvideo.com/login
+http://YOUR_HOSTNAME/login
 ```
 
 The login page should match the application previously reached through the Elastic IP.
@@ -1012,7 +1012,7 @@ sudo apt install -y certbot python3-certbot-nginx
 Request a certificate for the exact hostname:
 
 ```bash
-sudo certbot --nginx -d evan.badmintonvideo.com
+sudo certbot --nginx -d YOUR_HOSTNAME
 ```
 
 During the prompts:
@@ -1029,7 +1029,7 @@ Verify:
 sudo nginx -t
 sudo systemctl status nginx --no-pager -l
 sudo certbot certificates
-curl -I https://evan.badmintonvideo.com/login
+curl -I https://YOUR_HOSTNAME/login
 ```
 
 A normal result may be `200 OK` or an application redirect.
@@ -1063,7 +1063,7 @@ APP_BASE_URL=http://YOUR_ELASTIC_IP
 Replace it with:
 
 ```ini
-APP_BASE_URL=https://evan.badmintonvideo.com
+APP_BASE_URL=https://YOUR_HOSTNAME
 ```
 
 Do not add a trailing slash.
@@ -1085,7 +1085,7 @@ grep '^APP_BASE_URL=' /srv/badminton-video-vault/.env
 Expected:
 
 ```text
-APP_BASE_URL=https://evan.badmintonvideo.com
+APP_BASE_URL=https://YOUR_HOSTNAME
 ```
 
 ---
@@ -1123,7 +1123,7 @@ During migration, allow both the temporary HTTP origin and the final HTTPS origi
     "AllowedMethods": ["GET", "PUT"],
     "AllowedOrigins": [
       "http://YOUR_ELASTIC_IP",
-      "https://evan.badmintonvideo.com"
+      "https://YOUR_HOSTNAME"
     ],
     "ExposeHeaders": ["ETag"],
     "MaxAgeSeconds": 3600
@@ -1138,7 +1138,7 @@ After HTTPS uploads work, remove the temporary HTTP origin:
   {
     "AllowedHeaders": ["*"],
     "AllowedMethods": ["GET", "PUT"],
-    "AllowedOrigins": ["https://evan.badmintonvideo.com"],
+    "AllowedOrigins": ["https://YOUR_HOSTNAME"],
     "ExposeHeaders": ["ETag"],
     "MaxAgeSeconds": 3600
   }
@@ -1156,18 +1156,18 @@ Do not use `"*"` for `AllowedOrigins` on the private production vault. Updating 
 Verify the HTTP-to-HTTPS redirect:
 
 ```bash
-curl -I http://evan.badmintonvideo.com/login
+curl -I http://YOUR_HOSTNAME/login
 ```
 
 Verify HTTPS directly:
 
 ```bash
-curl -I https://evan.badmintonvideo.com/login
+curl -I https://YOUR_HOSTNAME/login
 ```
 
 Then test in a browser:
 
-1. Open `https://evan.badmintonvideo.com`.
+1. Open `https://YOUR_HOSTNAME`.
 2. Confirm the browser reports a valid secure connection.
 3. Sign in.
 4. Upload a small MP4 before testing a large file.
@@ -1214,7 +1214,7 @@ Use the hostname instead of the Elastic IP for normal access from now on.
 Useful diagnostics:
 
 ```bash
-dig +short A evan.badmintonvideo.com
+dig +short A YOUR_HOSTNAME
 sudo nginx -t
 sudo systemctl status nginx --no-pager -l
 sudo systemctl status badminton-vault --no-pager -l
