@@ -794,7 +794,25 @@ Fix any failure before continuing.
 
 ### 12.3 Create the DNS A Record
 
-Sign in to the company that manages DNS for the root domain. This may be WHOIS/MyOrderBox, Route 53, Cloudflare, GoDaddy, Namecheap, Squarespace Domains, or another provider.
+#### Is Amazon Route 53 required?
+
+**No. Route 53 is optional.** Use the DNS provider whose nameservers are currently authoritative for your domain.
+
+- If your domain's DNS is already managed by WHOIS/MyOrderBox, Cloudflare, GoDaddy, Namecheap, Squarespace Domains, or another provider, create the `A` record there and skip the Route 53 steps.
+- Creating a Route 53 hosted zone by itself does not make Route 53 active. The domain continues using its current DNS provider until its nameservers are changed at the registrar.
+- Moving DNS to Route 53 is a separate migration. Before changing nameservers, recreate every required record in Route 53, including existing `A`, `CNAME`, `MX`, `TXT`, SPF, DKIM, and DMARC records. Missing records can interrupt websites or email.
+- Do not create matching records at multiple DNS providers and expect both sets to control the domain. Only the provider named by the domain's authoritative nameservers is live.
+
+For a working WHOIS/MyOrderBox setup, the path is simply:
+
+```text
+WHOIS/MyOrderBox DNS
+        -> A record for the chosen subdomain
+        -> EC2 Elastic IP
+        -> Nginx on the badminton vault EC2 instance
+```
+
+Sign in to the company that currently manages DNS for the root domain. This may be WHOIS/MyOrderBox, Route 53, Cloudflare, GoDaddy, Namecheap, Squarespace Domains, or another provider.
 
 Look for **DNS Management**, **Manage DNS**, **Zone Editor**, or **DNS Records**.
 
