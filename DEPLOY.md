@@ -313,6 +313,8 @@ The browser sends video parts directly to S3. S3 therefore needs an exact-origin
 
 Do not add a trailing slash to the origin.
 
+> **Temporary setting:** `http://YOUR_ELASTIC_IP` is only for the initial HTTP test. As soon as users open the application through an HTTPS hostname, update this CORS rule to include that exact HTTPS origin. An IP address and a hostname are different origins, and different subdomains are also different origins. For example, `https://evan.badmintonvideo.com` does not permit uploads from `https://yk.badmintonvideo.com`.
+
 ### Delete abandoned multipart uploads
 
 1. Open **S3 → your bucket → Management**.
@@ -1164,6 +1166,16 @@ After HTTPS uploads work, remove the temporary HTTP origin:
 ```
 
 The origin must match the browser address exactly and must not have a trailing slash.
+
+Examples of separate origins that must each be listed when they are used:
+
+```text
+http://YOUR_ELASTIC_IP
+https://evan.badmintonvideo.com
+https://yk.badmintonvideo.com
+```
+
+Changing DNS, Nginx, Certbot, or `APP_BASE_URL` does **not** update S3 CORS automatically. If the website opens normally but upload displays `The browser could not upload a part to S3. Check the bucket CORS rule and your network connection.`, check this CORS rule first, add the exact HTTPS hostname origin, and remove the old IP origin only after HTTPS uploads work.
 
 Do not use `"*"` for `AllowedOrigins` on the private production vault. Updating CORS does not make the bucket public.
 
