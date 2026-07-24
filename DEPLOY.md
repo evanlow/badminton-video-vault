@@ -1175,7 +1175,7 @@ https://evan.badmintonvideo.com
 https://yk.badmintonvideo.com
 ```
 
-Changing DNS, Nginx, Certbot, or `APP_BASE_URL` does **not** update S3 CORS automatically. If the website opens normally but upload displays a message such as `The browser could not upload a part to S3`, check this CORS rule first and replace the old IP origin with the exact HTTPS hostname.
+Changing DNS, Nginx, Certbot, or `APP_BASE_URL` does **not** update S3 CORS automatically. If the website opens normally but upload displays `The browser could not upload a part to S3. Check the bucket CORS rule and your network connection.`, check this CORS rule first, add the exact HTTPS hostname origin, and remove the old IP origin only after HTTPS uploads work.
 
 Do not use `"*"` for `AllowedOrigins` on the private production vault. Updating CORS does not make the bucket public.
 
