@@ -870,7 +870,11 @@ def api_csrf_token():
         )
     except RuntimeError as exc:
         logger.error("Invalid WTF_CSRF_TIME_LIMIT: %s", exc)
-        return _json_error(str(exc), 500, code="csrf_config_invalid")
+        return _json_error(
+            "CSRF configuration is invalid.",
+            500,
+            code="csrf_config_invalid",
+        )
 
     response = jsonify(
         {

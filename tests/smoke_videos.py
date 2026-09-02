@@ -358,7 +358,7 @@ class TestMultipartUpload(BaseTestCase):
         self.assertEqual(csrf_response.status_code, 500)
         payload = csrf_response.get_json()
         self.assertEqual(payload["code"], "csrf_config_invalid")
-        self.assertIn("WTF_CSRF_TIME_LIMIT", payload["error"])
+        self.assertEqual(payload["error"], "CSRF configuration is invalid.")
 
     def test_initiate_accepts_exactly_the_configured_limit_as_192_ordered_parts(self):
         self.login_as_owner()
