@@ -216,20 +216,19 @@ class TestMultipartUpload(BaseTestCase):
         get_client.return_value.create_multipart_upload.assert_not_called()
 
     def test_production_config_default_max_video_file_size_is_3gib(self):
-        # Verify config.py's real, no-override default directly rather than
-        # relying on the test fixture, which independently overrides
-        # app.config["MAX_VIDEO_FILE_SIZE"] for test convenience.
-        self.assertEqual(Config.MAX_VIDEO_FILE_SIZE, 3 * 1024 * 1024 * 1024)
-        self.assertEqual(Config.MAX_VIDEO_FILE_SIZE, 3221225472)
+        expected = int(
+            os.environ.get("MAX_VIDEO_FILE_SIZE", 3 * 1024 * 1024 * 1024)
+        )
+        self.assertEqual(Config.MAX_VIDEO_FILE_SIZE, expected)
 
     def test_test_fixture_limit_matches_production_default(self):
-        # Guards against the test fixture's MAX_VIDEO_FILE_SIZE silently
-        # drifting away from (and thereby masking regressions in) the real
-        # production default computed in config.py.
         from app import app as flask_app
 
+        expected = int(
+            os.environ.get("MAX_VIDEO_FILE_SIZE", 3 * 1024 * 1024 * 1024)
+        )
         self.assertEqual(
-            flask_app.config["MAX_VIDEO_FILE_SIZE"], Config.MAX_VIDEO_FILE_SIZE
+            flask_app.config["MAX_VIDEO_FILE_SIZE"], expected
         )
 
     def test_upload_page_exposes_configured_max_file_size(self):

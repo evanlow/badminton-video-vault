@@ -244,8 +244,15 @@
   }
 
   async function ensureFreshPartUrl(part, partIndex, partState) {
+    if (partState.expiresInMs <= 0) {
+      return;
+    }
     const age = Date.now() - partState.issuedAt[partIndex];
-    if (age >= partState.expiresInMs - PART_URL_REFRESH_BUFFER_MS) {
+    const refreshBufferMs = Math.min(
+      PART_URL_REFRESH_BUFFER_MS,
+      Math.floor(partState.expiresInMs / 2)
+    );
+    if (age >= partState.expiresInMs - refreshBufferMs) {
       await refreshPartUrl(part, partIndex, partState);
     }
   }
