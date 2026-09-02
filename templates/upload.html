@@ -26,6 +26,7 @@
           data-initiate-url="{{ url_for('multipart_upload_initiate') }}"
           data-complete-url="{{ url_for('multipart_upload_complete') }}"
           data-abort-url="{{ url_for('multipart_upload_abort') }}"
+          data-refresh-part-url="{{ url_for('multipart_upload_refresh_part') }}"
           data-max-file-size="{{ max_video_file_size }}"
           data-upload-concurrency="{{ multipart_upload_concurrency }}"
         >

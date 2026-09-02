@@ -910,6 +910,42 @@ def multipart_upload_complete():
     )
 
 
+@app.post("/api/uploads/multipart/refresh-part")
+@login_required
+def multipart_upload_refresh_part():
+    try:
+        request_payload = _required_json_object()
+        upload_payload = _load_upload_token(request_payload.get("upload_token"))
+        part_number = request_payload.get("part_number")
+        if isinstance(part_number, bool) or not isinstance(part_number, int):
+            raise UploadValidationError("Part number is invalid.")
+        total_parts = int(upload_payload["total_parts"])
+        if part_number < 1 or part_number > total_parts:
+            raise UploadValidationError("Part number is invalid.")
+    except UploadValidationError as exc:
+        return _json_error(str(exc))
+
+    s3 = get_s3_client()
+    try:
+        url = generate_presigned_part_url(
+            upload_payload["s3_key"],
+            upload_payload["upload_id"],
+            part_number,
+            s3=s3,
+        )
+    except (ClientError, BotoCoreError) as exc:
+        logger.exception("Could not refresh presigned part URL: %s", exc)
+        return _json_error("Could not refresh the upload URL. Please try again.", 502)
+
+    return jsonify(
+        {
+            "part_number": part_number,
+            "url": url,
+            "expires_in": int(app.config["S3_MULTIPART_URL_EXPIRY"]),
+        }
+    )
+
+
 @app.post("/api/uploads/multipart/abort")
 @login_required
 def multipart_upload_abort():
