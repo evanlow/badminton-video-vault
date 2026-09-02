@@ -44,6 +44,7 @@
     Number.isFinite(csrfTokenLifetimeSeconds) && csrfTokenLifetimeSeconds > 0
       ? csrfTokenLifetimeSeconds * 1000
       : 0;
+  let csrfTokenRefreshPromise = null;
   let uploadInProgress = false;
   let uploadCompleted = false;
   let cancelRequested = false;
@@ -149,6 +150,22 @@
     }
   }
 
+  async function refreshCsrfTokenSingleFlight() {
+    if (csrfTokenRefreshPromise) {
+      return csrfTokenRefreshPromise;
+    }
+
+    csrfTokenRefreshPromise = (async () => {
+      await refreshCsrfToken();
+    })();
+
+    try {
+      await csrfTokenRefreshPromise;
+    } finally {
+      csrfTokenRefreshPromise = null;
+    }
+  }
+
   async function ensureFreshCsrfToken() {
     if (csrfTokenMaxAgeMs <= 0) {
       return;
@@ -159,7 +176,7 @@
       Math.floor(csrfTokenMaxAgeMs / 2)
     );
     if (age >= csrfTokenMaxAgeMs - refreshBufferMs) {
-      await refreshCsrfToken();
+      await refreshCsrfTokenSingleFlight();
     }
   }
 
@@ -198,7 +215,7 @@
       error.payload = payload;
       error.code = payload.code;
       if (!options.skipCsrfRefresh && !options._retryingAfterCsrf && isCsrfError(error)) {
-        await refreshCsrfToken();
+        await refreshCsrfTokenSingleFlight();
         return postJson(url, body, {
           ...options,
           _retryingAfterCsrf: true,

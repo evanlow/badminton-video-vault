@@ -530,6 +530,40 @@ class TestMultipartUpload(BaseTestCase):
 
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
 
+    def test_two_successive_csrf_tokens_remain_valid_for_multipart_requests(self):
+        self.login_as_owner()
+        from app import app as flask_app
+
+        original_csrf_enabled = flask_app.config.get("WTF_CSRF_ENABLED")
+        original_csrf_time_limit = flask_app.config.get("WTF_CSRF_TIME_LIMIT")
+        flask_app.config["WTF_CSRF_ENABLED"] = True
+        flask_app.config["WTF_CSRF_TIME_LIMIT"] = 3600
+        try:
+            first_token_response = self.client.get("/api/csrf-token")
+            self.assertEqual(first_token_response.status_code, 200)
+            first_token = first_token_response.get_json()["csrf_token"]
+
+            second_token_response = self.client.get("/api/csrf-token")
+            self.assertEqual(second_token_response.status_code, 200)
+            second_token = second_token_response.get_json()["csrf_token"]
+
+            with self.mock_s3() as get_client:
+                s3 = get_client.return_value
+                first_initiation = self._initiate(
+                    s3,
+                    headers={"X-CSRFToken": first_token},
+                )
+                second_initiation = self._initiate(
+                    s3,
+                    headers={"X-CSRFToken": second_token},
+                )
+        finally:
+            flask_app.config["WTF_CSRF_ENABLED"] = original_csrf_enabled
+            flask_app.config["WTF_CSRF_TIME_LIMIT"] = original_csrf_time_limit
+
+        self.assertTrue(first_initiation["upload_token"])
+        self.assertTrue(second_initiation["upload_token"])
+
     def test_expired_csrf_can_be_refreshed_for_multipart_upload(self):
         self.login_as_owner()
         from app import app as flask_app

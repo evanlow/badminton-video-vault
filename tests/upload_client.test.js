@@ -62,9 +62,9 @@ async function main() {
     abortUrl: "/api/uploads/multipart/abort",
     refreshPartUrl: "/api/uploads/multipart/refresh-part",
     csrfTokenUrl: "/api/csrf-token",
-    csrfTokenLifetimeSeconds: "1",
+    csrfTokenLifetimeSeconds: "2",
     maxFileSize: String(3 * 1024 * 1024 * 1024),
-    uploadConcurrency: "1",
+    uploadConcurrency: "2",
   };
   form.querySelector = (selector) =>
     selector === 'input[name="csrf_token"]' ? csrfHiddenField : null;
@@ -84,7 +84,7 @@ async function main() {
 
   const fakeFile = {
     name: "match.mp4",
-    size: 15,
+    size: 20,
     slice(start, end) {
       return { size: end - start };
     },
@@ -114,6 +114,7 @@ async function main() {
   const fetchCalls = [];
   const s3PutUrls = [];
   let refreshPartCallCount = 0;
+  let csrfTokenGetCount = 0;
 
   const makeFetchResponse = (status, payload) => ({
     ok: status >= 200 && status < 300,
@@ -129,44 +130,61 @@ async function main() {
   const fetch = async (url, options = {}) => {
     fetchCalls.push({ url, options });
     if (url === "/api/csrf-token" && options.method === "GET") {
+      csrfTokenGetCount += 1;
+      await Promise.resolve();
       return makeFetchResponse(200, { csrf_token: "csrf-new", expires_in: 3600 });
     }
     if (url === "/api/uploads/multipart/initiate") {
-      assert.equal(options.headers["X-CSRFToken"], "csrf-new");
+      assert.equal(options.headers["X-CSRFToken"], "csrf-old");
       return makeFetchResponse(200, {
         upload_token: "token-1",
         upload_token_expires_in: 1,
-        part_size: 16 * 1024 * 1024,
-        total_parts: 1,
-        parts: [{ part_number: 1, url: "https://s3/original" }],
+        part_size: 10,
+        total_parts: 2,
+        parts: [
+          { part_number: 1, url: "https://s3/original-1" },
+          { part_number: 2, url: "https://s3/original-2" },
+        ],
         expires_in: 1,
       });
     }
     if (url === "/api/uploads/multipart/refresh-part") {
       refreshPartCallCount += 1;
+      assert.equal(options.headers["X-CSRFToken"], "csrf-new");
       const requestBody = JSON.parse(options.body);
-      if (refreshPartCallCount === 1) {
-        assert.equal(requestBody.upload_token, "token-1");
+      if (requestBody.part_number === 1 && requestBody.upload_token === "token-2") {
+        return makeFetchResponse(200, {
+          part_number: 1,
+          url: "https://s3/refreshed-retry",
+          expires_in: 3600,
+          upload_token: "token-3",
+          upload_token_expires_in: 3600,
+        });
+      }
+      if (requestBody.part_number === 1) {
         return makeFetchResponse(200, {
           part_number: 1,
           url: "https://s3/refreshed-proactive",
           expires_in: 3600,
           upload_token: "token-2",
-          upload_token_expires_in: 1,
+          upload_token_expires_in: 3600,
         });
       }
-      assert.equal(requestBody.upload_token, "token-2");
-      return makeFetchResponse(200, {
-        part_number: 1,
-        url: "https://s3/refreshed-retry",
-        expires_in: 3600,
-        upload_token: "token-3",
-        upload_token_expires_in: 3600,
-      });
+      if (requestBody.part_number === 2) {
+        return makeFetchResponse(200, {
+          part_number: 2,
+          url: "https://s3/refreshed-proactive-2",
+          expires_in: 3600,
+          upload_token: "token-2",
+          upload_token_expires_in: 3600,
+        });
+      }
+      throw new Error(`Unexpected part_number ${requestBody.part_number}`);
     }
     if (url === "/api/uploads/multipart/complete") {
       const requestBody = JSON.parse(options.body);
-      assert.equal(requestBody.upload_token, "token-3");
+      assert.notEqual(requestBody.upload_token, "token-1");
+      assert.equal(requestBody.parts.length, 2);
       return makeFetchResponse(200, { redirect_url: "/videos/123" });
     }
     if (url === "/api/uploads/multipart/abort") {
@@ -275,11 +293,11 @@ async function main() {
     preventDefault() {},
   });
 
-  assert.equal(refreshPartCallCount, 2, "refresh endpoint should be called twice");
-  assert.deepEqual(s3PutUrls, [
-    "https://s3/refreshed-proactive",
-    "https://s3/refreshed-retry",
-  ]);
+  assert.equal(csrfTokenGetCount, 1, "single-flight CSRF refresh should issue one GET");
+  assert.ok(refreshPartCallCount >= 3, "refresh endpoint should be called for both parts and retry");
+  assert.ok(s3PutUrls.includes("https://s3/refreshed-proactive"));
+  assert.ok(s3PutUrls.includes("https://s3/refreshed-proactive-2"));
+  assert.ok(s3PutUrls.includes("https://s3/refreshed-retry"));
 
   const csrfFetch = fetchCalls.find(
     (call) => call.url === "/api/csrf-token" && call.options.method === "GET"

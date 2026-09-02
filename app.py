@@ -16,7 +16,6 @@ from flask import (
     redirect,
     render_template,
     request,
-    session,
     url_for,
 )
 from flask_login import (
@@ -841,7 +840,6 @@ def upload():
 @app.get("/api/csrf-token")
 @login_required
 def api_csrf_token():
-    session["csrf_token"] = secrets.token_hex(32)
     response = jsonify(
         {
             "csrf_token": generate_csrf(),
