@@ -230,6 +230,24 @@
     return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
   }
 
+  function computeRefreshBufferMs(maxAgeMs, preferredBufferMs) {
+    if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) {
+      return 0;
+    }
+    return Math.min(preferredBufferMs, Math.floor(maxAgeMs / 2));
+  }
+
+  function isUploadTokenRenewalDue() {
+    if (uploadTokenMaxAgeMs <= 0) {
+      return false;
+    }
+    const tokenRefreshBufferMs = computeRefreshBufferMs(
+      uploadTokenMaxAgeMs,
+      UPLOAD_TOKEN_REFRESH_BUFFER_MS
+    );
+    return Date.now() - uploadTokenIssuedAt >= uploadTokenMaxAgeMs - tokenRefreshBufferMs;
+  }
+
   function uploadPart(url, blob, partIndex, loadedByPart, updateOverallProgress) {
     return new Promise((resolve, reject) => {
       const s3Request = new XMLHttpRequest();
@@ -327,7 +345,9 @@
         }
         // The part may have failed because its presigned URL expired
         // mid-flight; force a refresh before the next attempt.
-        await refreshPartUrl(part, partIndex, partState);
+        await refreshPartUrl(part, partIndex, partState, {
+          requireUploadTokenRenewal: isUploadTokenRenewalDue(),
+        });
         await sleep(1000 * 2 ** (attempt - 1));
       }
     }
@@ -335,7 +355,12 @@
     throw lastError || new Error("An upload part failed.");
   }
 
-  async function refreshPartUrl(part, partIndex, partState) {
+  async function refreshPartUrl(
+    part,
+    partIndex,
+    partState,
+    options = {}
+  ) {
     if (!refreshPartUrlEndpoint) {
       return;
     }
@@ -357,7 +382,10 @@
         partState.expiresInMs = response.expires_in * 1000;
       }
     } catch (error) {
-      if (isExpiredUploadCredentialError(error)) {
+      if (
+        options.requireUploadTokenRenewal ||
+        isExpiredUploadCredentialError(error)
+      ) {
         throw error;
       }
       console.warn("Could not refresh a presigned part URL:", error);
@@ -368,25 +396,19 @@
     const age = Date.now() - partState.issuedAt[partIndex];
     let refreshForPartUrl = false;
     if (partState.expiresInMs > 0) {
-      const refreshBufferMs = Math.min(
-        PART_URL_REFRESH_BUFFER_MS,
-        Math.floor(partState.expiresInMs / 2)
+      const refreshBufferMs = computeRefreshBufferMs(
+        partState.expiresInMs,
+        PART_URL_REFRESH_BUFFER_MS
       );
       refreshForPartUrl = age >= partState.expiresInMs - refreshBufferMs;
     }
 
-    let refreshForUploadToken = false;
-    if (uploadTokenMaxAgeMs > 0) {
-      const tokenRefreshBufferMs = Math.min(
-        UPLOAD_TOKEN_REFRESH_BUFFER_MS,
-        Math.floor(uploadTokenMaxAgeMs / 2)
-      );
-      refreshForUploadToken =
-        Date.now() - uploadTokenIssuedAt >= uploadTokenMaxAgeMs - tokenRefreshBufferMs;
-    }
+    const refreshForUploadToken = isUploadTokenRenewalDue();
 
     if (refreshForPartUrl || refreshForUploadToken) {
-      await refreshPartUrl(part, partIndex, partState);
+      await refreshPartUrl(part, partIndex, partState, {
+        requireUploadTokenRenewal: refreshForUploadToken,
+      });
     }
   }
 
@@ -449,7 +471,27 @@
       () => worker()
     );
     await Promise.all(workers);
-    return completed;
+    return {
+      completedParts: completed,
+      parts,
+      partState,
+    };
+  }
+
+  async function ensureFreshUploadTokenBeforeComplete(uploadResult) {
+    if (!isUploadTokenRenewalDue()) {
+      return;
+    }
+    const lastPartIndex = uploadResult.parts.length - 1;
+    if (lastPartIndex < 0) {
+      return;
+    }
+    await refreshPartUrl(
+      uploadResult.parts[lastPartIndex],
+      lastPartIndex,
+      uploadResult.partState,
+      { requireUploadTokenRenewal: true }
+    );
   }
 
   async function abortRemoteUpload(options = {}) {
@@ -536,15 +578,16 @@
         `Uploading ${initiation.total_parts} part${initiation.total_parts === 1 ? "" : "s"} directly to S3…`
       );
 
-      const completedParts = await uploadAllParts(file, initiation);
+      const uploadResult = await uploadAllParts(file, initiation);
       if (cancelRequested) {
         throw new DOMException("Upload cancelled", "AbortError");
       }
+      await ensureFreshUploadTokenBeforeComplete(uploadResult);
 
       setProgress(100, "Finalising upload and saving metadata…");
       const completion = await postJson(completeUrl, {
         upload_token: uploadToken,
-        parts: completedParts,
+        parts: uploadResult.completedParts,
       });
 
       uploadCompleted = true;

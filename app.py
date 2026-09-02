@@ -195,6 +195,27 @@ def _required_json_object():
     return payload
 
 
+def _normalise_csrf_time_limit_seconds(raw_value):
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool):
+        raise RuntimeError("WTF_CSRF_TIME_LIMIT must be a non-negative number or None.")
+
+    if hasattr(raw_value, "total_seconds"):
+        raw_value = raw_value.total_seconds()
+
+    try:
+        seconds = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "WTF_CSRF_TIME_LIMIT must be a non-negative number, timedelta, or None."
+        ) from exc
+
+    if seconds < 0:
+        raise RuntimeError("WTF_CSRF_TIME_LIMIT must be non-negative.")
+    return seconds
+
+
 def _normalise_text(value, field_name, max_length, required=False):
     if value is None:
         value = ""
@@ -828,22 +849,33 @@ def upload():
             "warning",
         )
 
+    csrf_token_lifetime_seconds = _normalise_csrf_time_limit_seconds(
+        app.config.get("WTF_CSRF_TIME_LIMIT", 3600)
+    )
     return render_template(
         "upload.html",
         form=form,
         max_video_file_size=int(app.config["MAX_VIDEO_FILE_SIZE"]),
         multipart_upload_concurrency=int(app.config["S3_MULTIPART_CONCURRENCY"]),
-        csrf_token_lifetime_seconds=app.config.get("WTF_CSRF_TIME_LIMIT", 3600),
+        csrf_token_lifetime_seconds=csrf_token_lifetime_seconds,
     )
 
 
 @app.get("/api/csrf-token")
 @login_required
 def api_csrf_token():
+    try:
+        expires_in = _normalise_csrf_time_limit_seconds(
+            app.config.get("WTF_CSRF_TIME_LIMIT", 3600)
+        )
+    except RuntimeError as exc:
+        logger.error("Invalid WTF_CSRF_TIME_LIMIT: %s", exc)
+        return _json_error(str(exc), 500, code="csrf_config_invalid")
+
     response = jsonify(
         {
             "csrf_token": generate_csrf(),
-            "expires_in": app.config.get("WTF_CSRF_TIME_LIMIT", 3600),
+            "expires_in": expires_in,
         }
     )
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"

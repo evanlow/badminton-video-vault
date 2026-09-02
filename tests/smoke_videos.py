@@ -5,6 +5,7 @@ import re
 import sys
 import time
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 from wtforms.validators import ValidationError
 
@@ -279,6 +280,85 @@ class TestMultipartUpload(BaseTestCase):
             f'data-max-file-size="{Config.MAX_VIDEO_FILE_SIZE}"'.encode(),
             response.data,
         )
+
+    def test_csrf_lifetime_integer_is_exposed_in_upload_and_api(self):
+        self.login_as_owner()
+        from app import app as flask_app
+
+        original_value = flask_app.config.get("WTF_CSRF_TIME_LIMIT")
+        flask_app.config["WTF_CSRF_TIME_LIMIT"] = 1234
+        try:
+            upload_page = self.client.get("/upload")
+            self.assertEqual(upload_page.status_code, 200)
+            self.assertIn(
+                b'data-csrf-token-lifetime-seconds="1234"',
+                upload_page.data,
+            )
+
+            csrf_response = self.client.get("/api/csrf-token")
+            self.assertEqual(csrf_response.status_code, 200)
+            payload = csrf_response.get_json()
+            self.assertEqual(payload["expires_in"], 1234)
+        finally:
+            flask_app.config["WTF_CSRF_TIME_LIMIT"] = original_value
+
+    def test_csrf_lifetime_timedelta_normalises_to_seconds(self):
+        self.login_as_owner()
+        from app import app as flask_app
+
+        original_value = flask_app.config.get("WTF_CSRF_TIME_LIMIT")
+        flask_app.config["WTF_CSRF_TIME_LIMIT"] = timedelta(hours=1)
+        try:
+            upload_page = self.client.get("/upload")
+            self.assertEqual(upload_page.status_code, 200)
+            self.assertIn(
+                b'data-csrf-token-lifetime-seconds="3600"',
+                upload_page.data,
+            )
+
+            csrf_response = self.client.get("/api/csrf-token")
+            self.assertEqual(csrf_response.status_code, 200)
+            payload = csrf_response.get_json()
+            self.assertEqual(payload["expires_in"], 3600)
+        finally:
+            flask_app.config["WTF_CSRF_TIME_LIMIT"] = original_value
+
+    def test_csrf_lifetime_none_remains_disabled_and_json_encodes(self):
+        self.login_as_owner()
+        from app import app as flask_app
+
+        original_value = flask_app.config.get("WTF_CSRF_TIME_LIMIT")
+        flask_app.config["WTF_CSRF_TIME_LIMIT"] = None
+        try:
+            upload_page = self.client.get("/upload")
+            self.assertEqual(upload_page.status_code, 200)
+            self.assertIn(
+                b'data-csrf-token-lifetime-seconds=""',
+                upload_page.data,
+            )
+
+            csrf_response = self.client.get("/api/csrf-token")
+            self.assertEqual(csrf_response.status_code, 200)
+            payload = csrf_response.get_json()
+            self.assertIsNone(payload["expires_in"])
+        finally:
+            flask_app.config["WTF_CSRF_TIME_LIMIT"] = original_value
+
+    def test_csrf_lifetime_invalid_config_fails_clearly_in_api(self):
+        self.login_as_owner()
+        from app import app as flask_app
+
+        original_value = flask_app.config.get("WTF_CSRF_TIME_LIMIT")
+        flask_app.config["WTF_CSRF_TIME_LIMIT"] = "1:00:00"
+        try:
+            csrf_response = self.client.get("/api/csrf-token")
+        finally:
+            flask_app.config["WTF_CSRF_TIME_LIMIT"] = original_value
+
+        self.assertEqual(csrf_response.status_code, 500)
+        payload = csrf_response.get_json()
+        self.assertEqual(payload["code"], "csrf_config_invalid")
+        self.assertIn("WTF_CSRF_TIME_LIMIT", payload["error"])
 
     def test_initiate_accepts_exactly_the_configured_limit_as_192_ordered_parts(self):
         self.login_as_owner()
