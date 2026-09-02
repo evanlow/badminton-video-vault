@@ -24,11 +24,19 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run regression suite
         run: python tests/run_all_smoke.py
+
+      - name: Run upload client behavior test
+        run: node tests/upload_client.test.js
 
   # ── Job 2: Deploy to EC2 (only runs if test job passed) ────────────────────
   deploy:
@@ -52,6 +60,15 @@ jobs:
 
             # Pull latest code without creating an unexpected merge commit.
             git pull --ff-only origin main
+
+            # Upgrade the historical MAX_VIDEO_FILE_SIZE default (2 GiB) to
+            # the new 3 GiB default. Only rewrite the value if it still
+            # matches the old default exactly, preserving any deliberate
+            # custom override left in place by an operator.
+            if [ -f .env ] && grep -qx 'MAX_VIDEO_FILE_SIZE=2147483648' .env; then
+              sed -i 's/^MAX_VIDEO_FILE_SIZE=2147483648$/MAX_VIDEO_FILE_SIZE=3221225472/' .env
+              echo "Upgraded MAX_VIDEO_FILE_SIZE from the old 2 GiB default to 3 GiB."
+            fi
 
             # Activate venv and update dependencies.
             source venv/bin/activate

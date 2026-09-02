@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from functools import wraps
 
 import boto3
+from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import (
     Flask,
@@ -23,6 +24,7 @@ from flask_login import (
     login_user,
     logout_user,
 )
+from flask_wtf.csrf import CSRFError, generate_csrf
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import func, or_
 from sqlalchemy.exc import SQLAlchemyError
@@ -94,11 +96,12 @@ def get_s3_client():
         aws_access_key_id=app.config["AWS_ACCESS_KEY_ID"],
         aws_secret_access_key=app.config["AWS_SECRET_ACCESS_KEY"],
         region_name=app.config["AWS_REGION"],
+        config=BotocoreConfig(signature_version="s3v4"),
     )
 
 
 def generate_presigned_part_url(
-    s3_key, upload_id, part_number, expiry=None, s3=None
+    s3_key, upload_id, part_number, content_length, expiry=None, s3=None
 ):
     """Return a presigned URL for one S3 multipart-upload part."""
     s3 = s3 or get_s3_client()
@@ -110,6 +113,7 @@ def generate_presigned_part_url(
             "Key": s3_key,
             "UploadId": upload_id,
             "PartNumber": part_number,
+            "ContentLength": int(content_length),
         },
         ExpiresIn=expiry,
         HttpMethod="PUT",
@@ -165,8 +169,17 @@ def _multipart_serializer():
     return URLSafeTimedSerializer(app.config["SECRET_KEY"], salt=UPLOAD_TOKEN_SALT)
 
 
-def _json_error(message, status=400):
-    return jsonify({"error": message}), status
+def _issue_upload_token(payload):
+    token_payload = dict(payload)
+    token_payload["token_nonce"] = secrets.token_hex(8)
+    return _multipart_serializer().dumps(token_payload)
+
+
+def _json_error(message, status=400, code=None):
+    payload = {"error": message}
+    if code:
+        payload["code"] = code
+    return jsonify(payload), status
 
 
 def _client_error_code(exc):
@@ -180,6 +193,27 @@ def _required_json_object():
     if not isinstance(payload, dict):
         raise UploadValidationError("A JSON request body is required.")
     return payload
+
+
+def _normalise_csrf_time_limit_seconds(raw_value):
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool):
+        raise RuntimeError("WTF_CSRF_TIME_LIMIT must be a non-negative number or None.")
+
+    if hasattr(raw_value, "total_seconds"):
+        raw_value = raw_value.total_seconds()
+
+    try:
+        seconds = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "WTF_CSRF_TIME_LIMIT must be a non-negative number, timedelta, or None."
+        ) from exc
+
+    if seconds < 0:
+        raise RuntimeError("WTF_CSRF_TIME_LIMIT must be non-negative.")
+    return seconds
 
 
 def _normalise_text(value, field_name, max_length, required=False):
@@ -314,7 +348,117 @@ def _load_upload_token(token):
         raise UploadValidationError("Upload token is incomplete.")
     if not str(payload["s3_key"]).startswith(f"videos/{current_user.id}/"):
         raise UploadValidationError("Upload key is invalid.")
+
+    raw_part_size = payload.get("part_size", app.config["S3_MULTIPART_PART_SIZE"])
+    if isinstance(raw_part_size, bool):
+        raise UploadValidationError("Upload token is invalid.")
+    try:
+        payload["part_size"] = int(raw_part_size)
+    except (TypeError, ValueError) as exc:
+        raise UploadValidationError("Upload token is invalid.") from exc
+    if payload["part_size"] <= 0:
+        raise UploadValidationError("Upload token is invalid.")
     return payload
+
+
+def _expected_part_size(file_size, part_size, part_number, total_parts):
+    if part_number < 1 or part_number > total_parts:
+        raise UploadValidationError("Part number is invalid.")
+    if part_number < total_parts:
+        return part_size
+    bytes_before_last = part_size * (total_parts - 1)
+    return file_size - bytes_before_last
+
+
+def _list_multipart_upload_parts(s3, s3_key, upload_id):
+    all_parts = []
+    part_number_marker = 0
+    while True:
+        response = s3.list_parts(
+            Bucket=app.config["S3_BUCKET_NAME"],
+            Key=s3_key,
+            UploadId=upload_id,
+            MaxParts=1000,
+            PartNumberMarker=part_number_marker,
+        )
+        page_parts = response.get("Parts", [])
+        if not isinstance(page_parts, list):
+            raise UploadValidationError("S3 returned an invalid multipart part listing.")
+        all_parts.extend(page_parts)
+        if not response.get("IsTruncated"):
+            break
+        raw_next_marker = response.get("NextPartNumberMarker")
+        if raw_next_marker is None:
+            raw_next_marker = page_parts[-1].get("PartNumber") if page_parts else None
+        try:
+            next_marker = int(raw_next_marker)
+        except (TypeError, ValueError) as exc:
+            raise UploadValidationError(
+                "S3 returned an invalid multipart part listing."
+            ) from exc
+        if next_marker <= part_number_marker:
+            raise UploadValidationError("S3 returned an invalid multipart part listing.")
+        part_number_marker = next_marker
+    return all_parts
+
+
+def _normalise_etag(etag):
+    if not isinstance(etag, str):
+        return ""
+    return etag.strip().strip('"')
+
+
+def _validate_uploaded_parts_against_s3(upload_payload, completed_parts, s3_parts):
+    expected_count = int(upload_payload["total_parts"])
+    if len(s3_parts) != expected_count:
+        raise UploadValidationError(
+            "Uploaded part data in S3 does not match this upload session."
+        )
+
+    expected_numbers = list(range(1, expected_count + 1))
+    try:
+        actual_numbers = [int(part.get("PartNumber", -1)) for part in s3_parts]
+    except (TypeError, ValueError) as exc:
+        raise UploadValidationError(
+            "Uploaded part data in S3 does not match this upload session."
+        ) from exc
+    if actual_numbers != expected_numbers:
+        raise UploadValidationError(
+            "Uploaded part data in S3 does not match this upload session."
+        )
+
+    file_size = int(upload_payload["file_size"])
+    part_size = int(upload_payload["part_size"])
+    total_size = 0
+
+    for index, s3_part in enumerate(s3_parts):
+        part_number = expected_numbers[index]
+        expected_size = _expected_part_size(
+            file_size, part_size, part_number, expected_count
+        )
+        try:
+            actual_size = int(s3_part.get("Size", -1))
+        except (TypeError, ValueError) as exc:
+            raise UploadValidationError(
+                "Uploaded part data in S3 does not match this upload session."
+            ) from exc
+        if actual_size != expected_size:
+            raise UploadValidationError(
+                "Uploaded part data in S3 does not match this upload session."
+            )
+        total_size += actual_size
+
+        expected_etag = _normalise_etag(completed_parts[index]["ETag"])
+        actual_etag = _normalise_etag(s3_part.get("ETag"))
+        if expected_etag != actual_etag:
+            raise UploadValidationError(
+                "Uploaded part data in S3 does not match this upload session."
+            )
+
+    if total_size != file_size:
+        raise UploadValidationError(
+            "Uploaded part data in S3 does not match this upload session."
+        )
 
 
 def _validate_completed_parts(parts, expected_count):
@@ -705,12 +849,43 @@ def upload():
             "warning",
         )
 
+    csrf_token_lifetime_seconds = _normalise_csrf_time_limit_seconds(
+        app.config.get("WTF_CSRF_TIME_LIMIT", 3600)
+    )
     return render_template(
         "upload.html",
         form=form,
         max_video_file_size=int(app.config["MAX_VIDEO_FILE_SIZE"]),
         multipart_upload_concurrency=int(app.config["S3_MULTIPART_CONCURRENCY"]),
+        csrf_token_lifetime_seconds=csrf_token_lifetime_seconds,
     )
+
+
+@app.get("/api/csrf-token")
+@login_required
+def api_csrf_token():
+    try:
+        expires_in = _normalise_csrf_time_limit_seconds(
+            app.config.get("WTF_CSRF_TIME_LIMIT", 3600)
+        )
+    except RuntimeError as exc:
+        logger.error("Invalid WTF_CSRF_TIME_LIMIT: %s", exc)
+        return _json_error(
+            "CSRF configuration is invalid.",
+            500,
+            code="csrf_config_invalid",
+        )
+
+    response = jsonify(
+        {
+            "csrf_token": generate_csrf(),
+            "expires_in": expires_in,
+        }
+    )
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.post("/api/uploads/multipart/initiate")
@@ -745,7 +920,13 @@ def multipart_upload_initiate():
             {
                 "part_number": part_number,
                 "url": generate_presigned_part_url(
-                    s3_key, upload_id, part_number, s3=s3
+                    s3_key,
+                    upload_id,
+                    part_number,
+                    _expected_part_size(
+                        metadata["file_size"], part_size, part_number, total_parts
+                    ),
+                    s3=s3,
                 ),
             }
             for part_number in range(1, total_parts + 1)
@@ -761,7 +942,7 @@ def multipart_upload_initiate():
         logger.exception("Could not initiate S3 multipart upload: %s", exc)
         return _json_error("Could not start the S3 upload. Please try again.", 502)
 
-    upload_token = _multipart_serializer().dumps(
+    upload_token = _issue_upload_token(
         {
             "version": 1,
             "user_id": current_user.id,
@@ -771,6 +952,7 @@ def multipart_upload_initiate():
             "file_size": metadata["file_size"],
             "content_type": metadata["content_type"],
             "total_parts": total_parts,
+            "part_size": part_size,
             "metadata": {
                 "session_date": metadata["session_date"],
                 "notes": metadata["notes"],
@@ -788,6 +970,7 @@ def multipart_upload_initiate():
             "total_parts": total_parts,
             "parts": part_urls,
             "expires_in": int(app.config["S3_MULTIPART_URL_EXPIRY"]),
+            "upload_token_expires_in": int(app.config["S3_MULTIPART_TOKEN_MAX_AGE"]),
         }
     )
 
@@ -818,6 +1001,10 @@ def multipart_upload_complete():
 
     s3 = get_s3_client()
     try:
+        s3_parts = _list_multipart_upload_parts(
+            s3, upload_payload["s3_key"], upload_payload["upload_id"]
+        )
+        _validate_uploaded_parts_against_s3(upload_payload, completed_parts, s3_parts)
         s3.complete_multipart_upload(
             Bucket=app.config["S3_BUCKET_NAME"],
             Key=upload_payload["s3_key"],
@@ -840,6 +1027,21 @@ def multipart_upload_complete():
     except BotoCoreError as exc:
         logger.exception("Could not complete S3 multipart upload: %s", exc)
         return _json_error("S3 could not complete the upload. Please try again.", 502)
+    except UploadValidationError as exc:
+        logger.warning(
+            "Rejecting multipart completion for %s: %s",
+            upload_payload["s3_key"],
+            exc,
+        )
+        try:
+            _abort_multipart_upload(
+                s3,
+                upload_payload["s3_key"],
+                upload_payload["upload_id"],
+            )
+        except (ClientError, BotoCoreError):
+            logger.exception("Could not abort invalid multipart upload")
+        return _json_error(str(exc), 409)
 
     actual_size = int(head.get("ContentLength", -1))
     if actual_size != int(upload_payload["file_size"]):
@@ -906,6 +1108,52 @@ def multipart_upload_complete():
         {
             "video_id": video.id,
             "redirect_url": url_for("video_detail", video_id=video.id),
+        }
+    )
+
+
+@app.post("/api/uploads/multipart/refresh-part")
+@login_required
+def multipart_upload_refresh_part():
+    try:
+        request_payload = _required_json_object()
+        upload_payload = _load_upload_token(request_payload.get("upload_token"))
+        part_number = request_payload.get("part_number")
+        if isinstance(part_number, bool) or not isinstance(part_number, int):
+            raise UploadValidationError("Part number is invalid.")
+        total_parts = int(upload_payload["total_parts"])
+        if part_number < 1 or part_number > total_parts:
+            raise UploadValidationError("Part number is invalid.")
+    except UploadValidationError as exc:
+        return _json_error(str(exc))
+
+    s3 = get_s3_client()
+    try:
+        url = generate_presigned_part_url(
+            upload_payload["s3_key"],
+            upload_payload["upload_id"],
+            part_number,
+            _expected_part_size(
+                int(upload_payload["file_size"]),
+                int(upload_payload["part_size"]),
+                part_number,
+                total_parts,
+            ),
+            s3=s3,
+        )
+    except (ClientError, BotoCoreError) as exc:
+        logger.exception("Could not refresh presigned part URL: %s", exc)
+        return _json_error("Could not refresh the upload URL. Please try again.", 502)
+
+    refreshed_upload_token = _issue_upload_token(upload_payload)
+
+    return jsonify(
+        {
+            "part_number": part_number,
+            "url": url,
+            "expires_in": int(app.config["S3_MULTIPART_URL_EXPIRY"]),
+            "upload_token": refreshed_upload_token,
+            "upload_token_expires_in": int(app.config["S3_MULTIPART_TOKEN_MAX_AGE"]),
         }
     )
 
@@ -1125,6 +1373,21 @@ def admin_toggle_user(user_id):
 # ---------------------------------------------------------------------------
 # Error handlers
 # ---------------------------------------------------------------------------
+
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    if request.path.startswith("/api/"):
+        return _json_error(
+            e.description or "CSRF token is missing or invalid.",
+            400,
+            code="csrf_failed",
+        )
+    return render_template(
+        "error.html",
+        code=400,
+        message="The form security token is invalid or expired. Refresh and try again.",
+    ), 400
 
 
 @app.errorhandler(403)

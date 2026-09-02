@@ -33,6 +33,7 @@ sys.path.insert(0, _ROOT_DIR)
 # ─────────────────────────────────────────────────────────────────────────────
 
 from app import app  # noqa: E402  (must come after env var setup)
+from config import Config  # noqa: E402
 from extensions import db  # noqa: E402
 from models import User, Video  # noqa: E402
 
@@ -43,7 +44,7 @@ app.config.update(
         "WTF_CSRF_ENABLED": False,
         "SECRET_KEY": "test-secret-key",
         "APP_BASE_URL": "http://localhost",
-        "MAX_VIDEO_FILE_SIZE": 2 * 1024 * 1024 * 1024,
+        "MAX_VIDEO_FILE_SIZE": Config.MAX_VIDEO_FILE_SIZE,
         "S3_MULTIPART_PART_SIZE": 16 * 1024 * 1024,
         "S3_MULTIPART_URL_EXPIRY": 7200,
         "S3_MULTIPART_TOKEN_MAX_AGE": 21600,
@@ -65,6 +66,10 @@ def make_mock_s3_client():
     mock.create_multipart_upload.return_value = {"UploadId": "test-upload-id"}
     mock.complete_multipart_upload.return_value = {"ETag": '"multipart-etag"'}
     mock.head_object.return_value = {"ContentLength": 15}
+    mock.list_parts.return_value = {
+        "IsTruncated": False,
+        "Parts": [{"PartNumber": 1, "ETag": '"etag-1"', "Size": 15}],
+    }
     mock.abort_multipart_upload.return_value = {}
     mock.upload_fileobj.return_value = None
     mock.delete_object.return_value = {}

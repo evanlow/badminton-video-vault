@@ -69,12 +69,12 @@ Browser
 
 Default upload settings:
 
-- Maximum video size: 2 GiB
+- Maximum video size: 3 GiB
 - Part size: 16 MiB
 - Concurrent part uploads: 3
 - Automatic attempts per failed part: 3
 - Presigned part URL lifetime: 2 hours
-- Signed upload-token lifetime: 6 hours
+- Signed upload-token lifetime per token: 6 hours (renewed while the authenticated upload page remains open)
 
 The S3 bucket remains private. Upload, playback, and download use temporary presigned URLs.
 
@@ -518,7 +518,7 @@ AWS_REGION=YOUR_BUCKET_REGION
 S3_BUCKET_NAME=YOUR_EXACT_BUCKET_NAME
 PRESIGNED_URL_EXPIRY=3600
 
-MAX_VIDEO_FILE_SIZE=2147483648
+MAX_VIDEO_FILE_SIZE=3221225472
 MAX_REQUEST_BODY_SIZE=4194304
 S3_MULTIPART_PART_SIZE=16777216
 S3_MULTIPART_URL_EXPIRY=7200
@@ -1302,9 +1302,24 @@ Manual deployment:
 ```bash
 cd /srv/badminton-video-vault
 git pull --ff-only origin main
+
+# Upgrade the historical MAX_VIDEO_FILE_SIZE default (2 GiB) to the new
+# 3 GiB default. Only rewrite the value if it still matches the old
+# default exactly, preserving any deliberate custom override.
+if [ -f .env ] && grep -qx 'MAX_VIDEO_FILE_SIZE=2147483648' .env; then
+  sed -i 's/^MAX_VIDEO_FILE_SIZE=2147483648$/MAX_VIDEO_FILE_SIZE=3221225472/' .env
+  echo "Upgraded MAX_VIDEO_FILE_SIZE from the old 2 GiB default to 3 GiB."
+fi
+
 source venv/bin/activate
 python -m pip install -r requirements.txt
 sudo systemctl restart badminton-vault
+```
+
+Verify the effective limit took effect after the restart:
+
+```bash
+grep '^MAX_VIDEO_FILE_SIZE=' /srv/badminton-video-vault/.env || echo "Using the code default (3 GiB)."
 ```
 
 Verify through the Unix socket:
