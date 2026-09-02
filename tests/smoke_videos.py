@@ -6,6 +6,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests._test_helpers import BaseTestCase  # noqa: E402
+from config import Config  # noqa: E402
 from extensions import db  # noqa: E402
 from models import Video  # noqa: E402
 
@@ -203,15 +204,62 @@ class TestMultipartUpload(BaseTestCase):
 
     def test_initiate_rejects_file_larger_than_limit(self):
         self.login_as_owner()
-        with self.mock_s3():
+        with self.mock_s3() as get_client:
             response = self.client.post(
                 "/api/uploads/multipart/initiate",
                 json=self._initiate_payload(
-                    file_size=3 * 1024 * 1024 * 1024 + 1
+                    file_size=Config.MAX_VIDEO_FILE_SIZE + 1
                 ),
             )
         self.assertEqual(response.status_code, 400)
         self.assertIn("exceeds", response.get_json()["error"])
+        get_client.return_value.create_multipart_upload.assert_not_called()
+
+    def test_production_config_default_max_video_file_size_is_3gib(self):
+        # Verify config.py's real, no-override default directly rather than
+        # relying on the test fixture, which independently overrides
+        # app.config["MAX_VIDEO_FILE_SIZE"] for test convenience.
+        self.assertEqual(Config.MAX_VIDEO_FILE_SIZE, 3 * 1024 * 1024 * 1024)
+        self.assertEqual(Config.MAX_VIDEO_FILE_SIZE, 3221225472)
+
+    def test_test_fixture_limit_matches_production_default(self):
+        # Guards against the test fixture's MAX_VIDEO_FILE_SIZE silently
+        # drifting away from (and thereby masking regressions in) the real
+        # production default computed in config.py.
+        from app import app as flask_app
+
+        self.assertEqual(
+            flask_app.config["MAX_VIDEO_FILE_SIZE"], Config.MAX_VIDEO_FILE_SIZE
+        )
+
+    def test_upload_page_exposes_configured_max_file_size(self):
+        self.login_as_owner()
+        response = self.client.get("/upload")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            f'data-max-file-size="{Config.MAX_VIDEO_FILE_SIZE}"'.encode(),
+            response.data,
+        )
+
+    def test_initiate_accepts_exactly_the_configured_limit_as_192_ordered_parts(self):
+        self.login_as_owner()
+        with self.mock_s3() as get_client:
+            response = self.client.post(
+                "/api/uploads/multipart/initiate",
+                json=self._initiate_payload(file_size=Config.MAX_VIDEO_FILE_SIZE),
+            )
+            s3 = get_client.return_value
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        payload = response.get_json()
+        self.assertEqual(payload["total_parts"], 192)
+        self.assertEqual(len(payload["parts"]), 192)
+        self.assertEqual(
+            [part["part_number"] for part in payload["parts"]],
+            list(range(1, 193)),
+        )
+        s3.create_multipart_upload.assert_called_once()
+        self.assertEqual(s3.generate_presigned_url.call_count, 192)
 
     def test_complete_creates_video_record_after_s3_completion(self):
         self.login_as_owner()
@@ -283,6 +331,47 @@ class TestMultipartUpload(BaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["aborted"])
         s3.abort_multipart_upload.assert_called_once()
+
+    def test_refresh_part_returns_a_new_presigned_url_for_an_expired_part(self):
+        # Simulates a slow upload where a late part's originally-issued
+        # presigned URL has expired: the client asks the server for a fresh
+        # URL for that part number and the upload can still complete.
+        self.login_as_owner()
+        with self.mock_s3() as get_client:
+            s3 = get_client.return_value
+            initiation = self._initiate(s3)
+            response = self.client.post(
+                "/api/uploads/multipart/refresh-part",
+                json={
+                    "upload_token": initiation["upload_token"],
+                    "part_number": 1,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        payload = response.get_json()
+        self.assertEqual(payload["part_number"], 1)
+        self.assertIn("upload_part", payload["url"])
+        self.assertIn("expires_in", payload)
+        # generate_presigned_url is called once during initiation and once
+        # more for the refresh.
+        self.assertEqual(s3.generate_presigned_url.call_count, 2)
+
+    def test_refresh_part_rejects_out_of_range_part_number(self):
+        self.login_as_owner()
+        with self.mock_s3() as get_client:
+            s3 = get_client.return_value
+            initiation = self._initiate(s3)
+            response = self.client.post(
+                "/api/uploads/multipart/refresh-part",
+                json={
+                    "upload_token": initiation["upload_token"],
+                    "part_number": 99,
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Part number is invalid", response.get_json()["error"])
 
     def test_direct_upload_api_requires_login(self):
         response = self.client.post(

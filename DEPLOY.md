@@ -1302,9 +1302,24 @@ Manual deployment:
 ```bash
 cd /srv/badminton-video-vault
 git pull --ff-only origin main
+
+# Upgrade the historical MAX_VIDEO_FILE_SIZE default (2 GiB) to the new
+# 3 GiB default. Only rewrite the value if it still matches the old
+# default exactly, preserving any deliberate custom override.
+if [ -f .env ] && grep -qx 'MAX_VIDEO_FILE_SIZE=2147483648' .env; then
+  sed -i 's/^MAX_VIDEO_FILE_SIZE=2147483648$/MAX_VIDEO_FILE_SIZE=3221225472/' .env
+  echo "Upgraded MAX_VIDEO_FILE_SIZE from the old 2 GiB default to 3 GiB."
+fi
+
 source venv/bin/activate
 python -m pip install -r requirements.txt
 sudo systemctl restart badminton-vault
+```
+
+Verify the effective limit took effect after the restart:
+
+```bash
+grep '^MAX_VIDEO_FILE_SIZE=' /srv/badminton-video-vault/.env || echo "Using the code default (3 GiB)."
 ```
 
 Verify through the Unix socket:

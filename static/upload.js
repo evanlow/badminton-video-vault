@@ -20,7 +20,11 @@
   const initiateUrl = form.dataset.initiateUrl;
   const completeUrl = form.dataset.completeUrl;
   const abortUrl = form.dataset.abortUrl;
+  const refreshPartUrlEndpoint = form.dataset.refreshPartUrl;
   const maxFileSize = Number(form.dataset.maxFileSize);
+  // Refresh a part's presigned URL this far ahead of its expiry so that a
+  // slow upload never attempts to PUT with an already-expired signature.
+  const PART_URL_REFRESH_BUFFER_MS = 5 * 60 * 1000;
   const uploadConcurrency = Math.max(
     1,
     Number(form.dataset.uploadConcurrency) || 3
@@ -177,7 +181,8 @@
     blob,
     partIndex,
     loadedByPart,
-    updateOverallProgress
+    updateOverallProgress,
+    partState
   ) {
     const maxAttempts = 3;
     let lastError = null;
@@ -186,6 +191,8 @@
       if (cancelRequested) {
         throw new DOMException("Upload cancelled", "AbortError");
       }
+
+      await ensureFreshPartUrl(part, partIndex, partState);
 
       try {
         return await uploadPart(
@@ -207,6 +214,9 @@
         ) {
           throw error;
         }
+        // The part may have failed because its presigned URL expired
+        // mid-flight; force a refresh before the next attempt.
+        await refreshPartUrl(part, partIndex, partState);
         await sleep(1000 * 2 ** (attempt - 1));
       }
     }
@@ -214,10 +224,41 @@
     throw lastError || new Error("An upload part failed.");
   }
 
+  async function refreshPartUrl(part, partIndex, partState) {
+    if (!refreshPartUrlEndpoint) {
+      return;
+    }
+    try {
+      const response = await postJson(refreshPartUrlEndpoint, {
+        upload_token: uploadToken,
+        part_number: part.part_number,
+      });
+      part.url = response.url;
+      partState.issuedAt[partIndex] = Date.now();
+      if (response.expires_in) {
+        partState.expiresInMs = response.expires_in * 1000;
+      }
+    } catch (error) {
+      console.warn("Could not refresh a presigned part URL:", error);
+    }
+  }
+
+  async function ensureFreshPartUrl(part, partIndex, partState) {
+    const age = Date.now() - partState.issuedAt[partIndex];
+    if (age >= partState.expiresInMs - PART_URL_REFRESH_BUFFER_MS) {
+      await refreshPartUrl(part, partIndex, partState);
+    }
+  }
+
   async function uploadAllParts(file, initiation) {
     const parts = initiation.parts;
     const loadedByPart = new Array(parts.length).fill(0);
     const completed = new Array(parts.length);
+    const issuedAt = new Array(parts.length).fill(Date.now());
+    const partState = {
+      issuedAt,
+      expiresInMs: (Number(initiation.expires_in) || 7200) * 1000,
+    };
     let nextPartIndex = 0;
     let completedCount = 0;
 
@@ -251,7 +292,8 @@
           blob,
           partIndex,
           loadedByPart,
-          updateOverallProgress
+          updateOverallProgress,
+          partState
         );
         completed[partIndex] = {
           part_number: part.part_number,
