@@ -24,11 +24,19 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run regression suite
         run: python tests/run_all_smoke.py
+
+      - name: Run upload client behavior test
+        run: node tests/upload_client.test.js
 
   # ── Job 2: Deploy to EC2 (only runs if test job passed) ────────────────────
   deploy:

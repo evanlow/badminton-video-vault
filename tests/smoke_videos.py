@@ -1,7 +1,12 @@
 """Smoke tests: video list, video detail, direct S3 multipart upload, delete."""
+import importlib
 import os
+import re
 import sys
+import time
 import unittest
+from unittest.mock import patch
+from wtforms.validators import ValidationError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -148,12 +153,13 @@ class TestMultipartUpload(BaseTestCase):
         payload.update(overrides)
         return payload
 
-    def _initiate(self, s3, **overrides):
+    def _initiate(self, s3, headers=None, **overrides):
         payload = self._initiate_payload(**overrides)
         s3.head_object.return_value = {"ContentLength": payload["file_size"]}
         response = self.client.post(
             "/api/uploads/multipart/initiate",
             json=payload,
+            headers=headers,
         )
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return response.get_json()
@@ -188,8 +194,38 @@ class TestMultipartUpload(BaseTestCase):
         self.assertEqual(payload["total_parts"], 1)
         self.assertEqual(payload["parts"][0]["part_number"], 1)
         self.assertIn("upload_part", payload["parts"][0]["url"])
+        self.assertIn("upload_token_expires_in", payload)
         s3.create_multipart_upload.assert_called_once()
         s3.generate_presigned_url.assert_called_once()
+
+    def test_s3_client_forces_sigv4_signing(self):
+        from app import get_s3_client
+
+        with patch("app.boto3.client") as boto_client:
+            get_s3_client()
+
+        kwargs = boto_client.call_args.kwargs
+        self.assertIn("config", kwargs)
+        self.assertEqual(kwargs["config"].signature_version, "s3v4")
+
+    def test_initiate_presigns_exact_content_length_for_each_part(self):
+        self.login_as_owner()
+        oversized = (16 * 1024 * 1024) + 123
+        with self.mock_s3() as get_client:
+            s3 = get_client.return_value
+            response = self.client.post(
+                "/api/uploads/multipart/initiate",
+                json=self._initiate_payload(file_size=oversized),
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        self.assertEqual(s3.generate_presigned_url.call_count, 2)
+        first_call = s3.generate_presigned_url.call_args_list[0]
+        second_call = s3.generate_presigned_url.call_args_list[1]
+        self.assertEqual(first_call.kwargs["Params"]["PartNumber"], 1)
+        self.assertEqual(first_call.kwargs["Params"]["ContentLength"], 16 * 1024 * 1024)
+        self.assertEqual(second_call.kwargs["Params"]["PartNumber"], 2)
+        self.assertEqual(second_call.kwargs["Params"]["ContentLength"], 123)
 
     def test_initiate_rejects_invalid_extension(self):
         self.login_as_owner()
@@ -216,10 +252,14 @@ class TestMultipartUpload(BaseTestCase):
         get_client.return_value.create_multipart_upload.assert_not_called()
 
     def test_production_config_default_max_video_file_size_is_3gib(self):
-        expected = int(
-            os.environ.get("MAX_VIDEO_FILE_SIZE", 3 * 1024 * 1024 * 1024)
-        )
-        self.assertEqual(Config.MAX_VIDEO_FILE_SIZE, expected)
+        import config as config_module
+
+        with patch.dict(os.environ, {"FLASK_ENV": "development"}, clear=False):
+            os.environ.pop("MAX_VIDEO_FILE_SIZE", None)
+            with patch("dotenv.load_dotenv", return_value=False):
+                reloaded = importlib.reload(config_module)
+                self.assertEqual(reloaded.Config.MAX_VIDEO_FILE_SIZE, 3221225472)
+        importlib.reload(config_module)
 
     def test_test_fixture_limit_matches_production_default(self):
         from app import app as flask_app
@@ -260,6 +300,50 @@ class TestMultipartUpload(BaseTestCase):
         s3.create_multipart_upload.assert_called_once()
         self.assertEqual(s3.generate_presigned_url.call_count, 192)
 
+    def test_complete_rejects_mismatched_s3_part_size_before_assembly(self):
+        self.login_as_owner()
+        with self.mock_s3() as get_client:
+            s3 = get_client.return_value
+            initiation = self._initiate(s3)
+            s3.list_parts.return_value = {
+                "IsTruncated": False,
+                "Parts": [{"PartNumber": 1, "ETag": '"etag-1"', "Size": 14}],
+            }
+            response = self.client.post(
+                "/api/uploads/multipart/complete",
+                json={
+                    "upload_token": initiation["upload_token"],
+                    "parts": [{"part_number": 1, "etag": '"etag-1"'}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("does not match", response.get_json()["error"])
+        s3.complete_multipart_upload.assert_not_called()
+        s3.abort_multipart_upload.assert_called_once()
+
+    def test_complete_rejects_mismatched_s3_part_etag_before_assembly(self):
+        self.login_as_owner()
+        with self.mock_s3() as get_client:
+            s3 = get_client.return_value
+            initiation = self._initiate(s3)
+            s3.list_parts.return_value = {
+                "IsTruncated": False,
+                "Parts": [{"PartNumber": 1, "ETag": '"different"', "Size": 15}],
+            }
+            response = self.client.post(
+                "/api/uploads/multipart/complete",
+                json={
+                    "upload_token": initiation["upload_token"],
+                    "parts": [{"part_number": 1, "etag": '"etag-1"'}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("does not match", response.get_json()["error"])
+        s3.complete_multipart_upload.assert_not_called()
+        s3.abort_multipart_upload.assert_called_once()
+
     def test_complete_creates_video_record_after_s3_completion(self):
         self.login_as_owner()
         before = Video.query.count()
@@ -282,6 +366,7 @@ class TestMultipartUpload(BaseTestCase):
         self.assertEqual(video.file_size, 15)
         self.assertEqual(video.notes, "Training match")
         self.assertEqual(video.tags, "training,singles")
+        s3.list_parts.assert_called_once()
         s3.complete_multipart_upload.assert_called_once()
         s3.head_object.assert_called_once()
 
@@ -352,6 +437,9 @@ class TestMultipartUpload(BaseTestCase):
         self.assertEqual(payload["part_number"], 1)
         self.assertIn("upload_part", payload["url"])
         self.assertIn("expires_in", payload)
+        self.assertIn("upload_token", payload)
+        self.assertIn("upload_token_expires_in", payload)
+        self.assertNotEqual(payload["upload_token"], initiation["upload_token"])
         # generate_presigned_url is called once during initiation and once
         # more for the refresh.
         self.assertEqual(s3.generate_presigned_url.call_count, 2)
@@ -371,6 +459,131 @@ class TestMultipartUpload(BaseTestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("Part number is invalid", response.get_json()["error"])
+
+    def test_refresh_part_presigns_exact_content_length_for_final_part(self):
+        self.login_as_owner()
+        oversized = (16 * 1024 * 1024) + 123
+        with self.mock_s3() as get_client:
+            s3 = get_client.return_value
+            initiation = self._initiate(s3, file_size=oversized)
+            response = self.client.post(
+                "/api/uploads/multipart/refresh-part",
+                json={
+                    "upload_token": initiation["upload_token"],
+                    "part_number": 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        refresh_call = s3.generate_presigned_url.call_args_list[-1]
+        self.assertEqual(refresh_call.kwargs["Params"]["PartNumber"], 2)
+        self.assertEqual(refresh_call.kwargs["Params"]["ContentLength"], 123)
+
+    def test_refresh_part_rejects_another_users_upload_token(self):
+        self.login_as_owner()
+        with self.mock_s3() as get_client:
+            s3 = get_client.return_value
+            initiation = self._initiate(s3)
+            self.client.get("/logout")
+            self.login_as_other()
+            response = self.client.post(
+                "/api/uploads/multipart/refresh-part",
+                json={
+                    "upload_token": initiation["upload_token"],
+                    "part_number": 1,
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("does not belong", response.get_json()["error"])
+
+    def test_refresh_part_renews_upload_token_before_original_expiry(self):
+        self.login_as_owner()
+        from app import app as flask_app
+
+        original_max_age = flask_app.config["S3_MULTIPART_TOKEN_MAX_AGE"]
+        flask_app.config["S3_MULTIPART_TOKEN_MAX_AGE"] = 3
+        try:
+            with self.mock_s3() as get_client:
+                s3 = get_client.return_value
+                initiation = self._initiate(s3)
+                time.sleep(2.2)
+                refresh = self.client.post(
+                    "/api/uploads/multipart/refresh-part",
+                    json={
+                        "upload_token": initiation["upload_token"],
+                        "part_number": 1,
+                    },
+                )
+                self.assertEqual(refresh.status_code, 200)
+                refreshed_token = refresh.get_json()["upload_token"]
+                time.sleep(1.2)
+                response = self.client.post(
+                    "/api/uploads/multipart/complete",
+                    json={
+                        "upload_token": refreshed_token,
+                        "parts": [{"part_number": 1, "etag": '"etag-1"'}],
+                    },
+                )
+        finally:
+            flask_app.config["S3_MULTIPART_TOKEN_MAX_AGE"] = original_max_age
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+
+    def test_expired_csrf_can_be_refreshed_for_multipart_upload(self):
+        self.login_as_owner()
+        from app import app as flask_app
+
+        original_csrf_enabled = flask_app.config.get("WTF_CSRF_ENABLED")
+        original_csrf_time_limit = flask_app.config.get("WTF_CSRF_TIME_LIMIT")
+        flask_app.config["WTF_CSRF_ENABLED"] = True
+        flask_app.config["WTF_CSRF_TIME_LIMIT"] = 10
+        try:
+            upload_page = self.client.get("/upload")
+            html = upload_page.get_data(as_text=True)
+            match = re.search(r'name="csrf_token"[^>]*value="([^"]+)"', html)
+            self.assertIsNotNone(match)
+            expired_token = match.group(1)
+
+            with self.mock_s3() as get_client:
+                s3 = get_client.return_value
+                with patch(
+                    "flask_wtf.csrf.validate_csrf",
+                    side_effect=ValidationError("The CSRF token has expired."),
+                ):
+                    expired_attempt = self.client.post(
+                        "/api/uploads/multipart/initiate",
+                        json=self._initiate_payload(),
+                        headers={"X-CSRFToken": expired_token},
+                    )
+                self.assertEqual(expired_attempt.status_code, 400)
+                self.assertEqual(expired_attempt.get_json()["code"], "csrf_failed")
+
+                refresh = self.client.get("/api/csrf-token")
+                self.assertEqual(refresh.status_code, 200)
+                refreshed_payload = refresh.get_json()
+                refreshed_token = refreshed_payload["csrf_token"]
+                self.assertEqual(refreshed_payload["expires_in"], 10)
+                self.assertIn("no-store", refresh.headers["Cache-Control"])
+
+                with patch("flask_wtf.csrf.validate_csrf", return_value=True):
+                    initiation = self._initiate(
+                        s3,
+                        headers={"X-CSRFToken": refreshed_token},
+                    )
+                    completion = self.client.post(
+                        "/api/uploads/multipart/complete",
+                        json={
+                            "upload_token": initiation["upload_token"],
+                            "parts": [{"part_number": 1, "etag": '"etag-1"'}],
+                        },
+                        headers={"X-CSRFToken": refreshed_token},
+                    )
+        finally:
+            flask_app.config["WTF_CSRF_ENABLED"] = original_csrf_enabled
+            flask_app.config["WTF_CSRF_TIME_LIMIT"] = original_csrf_time_limit
+
+        self.assertEqual(completion.status_code, 200, completion.get_data(as_text=True))
 
     def test_direct_upload_api_requires_login(self):
         response = self.client.post(

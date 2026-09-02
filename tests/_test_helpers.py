@@ -66,6 +66,10 @@ def make_mock_s3_client():
     mock.create_multipart_upload.return_value = {"UploadId": "test-upload-id"}
     mock.complete_multipart_upload.return_value = {"ETag": '"multipart-etag"'}
     mock.head_object.return_value = {"ContentLength": 15}
+    mock.list_parts.return_value = {
+        "IsTruncated": False,
+        "Parts": [{"PartNumber": 1, "ETag": '"etag-1"', "Size": 15}],
+    }
     mock.abort_multipart_upload.return_value = {}
     mock.upload_fileobj.return_value = None
     mock.delete_object.return_value = {}

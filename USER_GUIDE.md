@@ -97,6 +97,7 @@ This design avoids copying a multi-gigabyte video through the application server
 
 - Several parts may upload in parallel.
 - A failed part is retried automatically up to three times.
+- While the page stays open and you remain logged in, the uploader refreshes its CSRF credential and signed upload token during long transfers.
 - Select **Cancel Upload** to stop the active requests and ask S3 to discard the incomplete upload.
 - Do not close or reload the page during an upload. Uploads do not currently resume after the page is closed.
 - If the browser cannot contact S3, verify your network and report the error message to the administrator; the bucket CORS configuration may need attention.

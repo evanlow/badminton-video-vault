@@ -5,7 +5,7 @@ A Flask web app for uploading, storing, sharing, and playing badminton session v
 ## Features
 
 - **Secure authentication** via Flask-Login (email + password)
-- **Direct browser-to-S3 multipart upload** with progress, cancellation, limited concurrency, and per-part retry
+- **Direct browser-to-S3 multipart upload** with progress, cancellation, CSRF renewal, token renewal, and per-part retry
 - **No large video body through Flask/EC2** — the application coordinates S3 and stores metadata in SQLite
 - **Presigned URLs** for private playback and optional download
 - **Visibility controls** — private / shared link / public per video
@@ -94,7 +94,7 @@ The app will be available at `http://localhost:5000`.
 | `MAX_REQUEST_BODY_SIZE` | Maximum Flask request body; default 4 MiB |
 | `S3_MULTIPART_PART_SIZE` | S3 part size; default 16 MiB |
 | `S3_MULTIPART_URL_EXPIRY` | Multipart part URL lifetime; default 7,200 seconds |
-| `S3_MULTIPART_TOKEN_MAX_AGE` | Signed coordination-token lifetime; default 21,600 seconds |
+| `S3_MULTIPART_TOKEN_MAX_AGE` | Signed coordination-token lifetime per token; default 21,600 seconds (renewed while upload page remains open) |
 | `S3_MULTIPART_CONCURRENCY` | Browser part-upload concurrency; default 3 |
 
 See `.env.example` for Mailgun and authentication-token settings.
@@ -119,7 +119,9 @@ S3 authorizes multipart creation, part upload, and completion through `s3:PutObj
 | `GET /logout` | Log out |
 | `GET /dashboard` | Dashboard |
 | `GET /upload` | Direct-upload page |
+| `GET /api/csrf-token` | Issue a fresh CSRF token for long-running authenticated uploads |
 | `POST /api/uploads/multipart/initiate` | Create S3 multipart upload and sign parts |
+| `POST /api/uploads/multipart/refresh-part` | Refresh a part URL and renew the signed upload token |
 | `POST /api/uploads/multipart/complete` | Complete S3 upload and save metadata |
 | `POST /api/uploads/multipart/abort` | Abort an incomplete upload |
 | `GET /videos` | Video list |

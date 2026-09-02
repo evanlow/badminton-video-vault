@@ -15,16 +15,20 @@
   const progressStatus = document.getElementById("uploadStatus");
   const progressPercent = document.getElementById("uploadPercent");
   const errorBox = document.getElementById("uploadError");
-  const csrfToken = form.querySelector('input[name="csrf_token"]').value;
+  let csrfToken = form.querySelector('input[name="csrf_token"]').value;
 
   const initiateUrl = form.dataset.initiateUrl;
   const completeUrl = form.dataset.completeUrl;
   const abortUrl = form.dataset.abortUrl;
   const refreshPartUrlEndpoint = form.dataset.refreshPartUrl;
+  const csrfTokenUrl = form.dataset.csrfTokenUrl;
   const maxFileSize = Number(form.dataset.maxFileSize);
+  const csrfTokenLifetimeSeconds = Number(form.dataset.csrfTokenLifetimeSeconds);
   // Refresh a part's presigned URL this far ahead of its expiry so that a
   // slow upload never attempts to PUT with an already-expired signature.
   const PART_URL_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+  const CSRF_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+  const UPLOAD_TOKEN_REFRESH_BUFFER_MS = 10 * 60 * 1000;
   const uploadConcurrency = Math.max(
     1,
     Number(form.dataset.uploadConcurrency) || 3
@@ -33,6 +37,13 @@
 
   const activeRequests = new Set();
   let uploadToken = null;
+  let uploadTokenIssuedAt = 0;
+  let uploadTokenMaxAgeMs = 0;
+  let csrfTokenIssuedAt = Date.now();
+  let csrfTokenMaxAgeMs =
+    Number.isFinite(csrfTokenLifetimeSeconds) && csrfTokenLifetimeSeconds > 0
+      ? csrfTokenLifetimeSeconds * 1000
+      : 0;
   let uploadInProgress = false;
   let uploadCompleted = false;
   let cancelRequested = false;
@@ -86,7 +97,77 @@
     progressContainer.classList.toggle("d-none", !isBusy);
   }
 
+  function isCsrfError(error) {
+    return (
+      error &&
+      error.code === "csrf_failed" &&
+      typeof error.message === "string" &&
+      error.message.length > 0
+    );
+  }
+
+  function isExpiredUploadCredentialError(error) {
+    const message =
+      error && typeof error.message === "string"
+        ? error.message.toLowerCase()
+        : "";
+    return (
+      message.includes("upload session has expired") ||
+      message.includes("upload session no longer exists") ||
+      message.includes("upload token is invalid") ||
+      message.includes("upload token does not belong")
+    );
+  }
+
+  async function refreshCsrfToken() {
+    if (!csrfTokenUrl) {
+      return;
+    }
+    const response = await fetch(csrfTokenUrl, {
+      method: "GET",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      const error = new Error(
+        payload.error || `The server returned HTTP ${response.status}.`
+      );
+      error.httpStatus = response.status;
+      error.payload = payload;
+      error.code = payload.code;
+      throw error;
+    }
+    csrfToken = payload.csrf_token;
+    csrfTokenIssuedAt = Date.now();
+    if (
+      Number.isFinite(Number(payload.expires_in)) &&
+      Number(payload.expires_in) > 0
+    ) {
+      csrfTokenMaxAgeMs = Number(payload.expires_in) * 1000;
+    }
+  }
+
+  async function ensureFreshCsrfToken() {
+    if (csrfTokenMaxAgeMs <= 0) {
+      return;
+    }
+    const age = Date.now() - csrfTokenIssuedAt;
+    const refreshBufferMs = Math.min(
+      CSRF_REFRESH_BUFFER_MS,
+      Math.floor(csrfTokenMaxAgeMs / 2)
+    );
+    if (age >= csrfTokenMaxAgeMs - refreshBufferMs) {
+      await refreshCsrfToken();
+    }
+  }
+
   async function postJson(url, body, options = {}) {
+    if (!options.skipCsrfRefresh) {
+      await ensureFreshCsrfToken();
+    }
+
     const response = await fetch(url, {
       method: "POST",
       credentials: "same-origin",
@@ -110,7 +191,20 @@
     }
 
     if (!response.ok) {
-      throw new Error(payload.error || `The server returned HTTP ${response.status}.`);
+      const error = new Error(
+        payload.error || `The server returned HTTP ${response.status}.`
+      );
+      error.httpStatus = response.status;
+      error.payload = payload;
+      error.code = payload.code;
+      if (!options.skipCsrfRefresh && !options._retryingAfterCsrf && isCsrfError(error)) {
+        await refreshCsrfToken();
+        return postJson(url, body, {
+          ...options,
+          _retryingAfterCsrf: true,
+        });
+      }
+      throw error;
     }
     return payload;
   }
@@ -235,24 +329,46 @@
       });
       part.url = response.url;
       partState.issuedAt[partIndex] = Date.now();
+      if (response.upload_token) {
+        uploadToken = response.upload_token;
+        uploadTokenIssuedAt = Date.now();
+      }
+      if (response.upload_token_expires_in) {
+        uploadTokenMaxAgeMs = response.upload_token_expires_in * 1000;
+      }
       if (response.expires_in) {
         partState.expiresInMs = response.expires_in * 1000;
       }
     } catch (error) {
+      if (isExpiredUploadCredentialError(error)) {
+        throw error;
+      }
       console.warn("Could not refresh a presigned part URL:", error);
     }
   }
 
   async function ensureFreshPartUrl(part, partIndex, partState) {
-    if (partState.expiresInMs <= 0) {
-      return;
-    }
     const age = Date.now() - partState.issuedAt[partIndex];
-    const refreshBufferMs = Math.min(
-      PART_URL_REFRESH_BUFFER_MS,
-      Math.floor(partState.expiresInMs / 2)
-    );
-    if (age >= partState.expiresInMs - refreshBufferMs) {
+    let refreshForPartUrl = false;
+    if (partState.expiresInMs > 0) {
+      const refreshBufferMs = Math.min(
+        PART_URL_REFRESH_BUFFER_MS,
+        Math.floor(partState.expiresInMs / 2)
+      );
+      refreshForPartUrl = age >= partState.expiresInMs - refreshBufferMs;
+    }
+
+    let refreshForUploadToken = false;
+    if (uploadTokenMaxAgeMs > 0) {
+      const tokenRefreshBufferMs = Math.min(
+        UPLOAD_TOKEN_REFRESH_BUFFER_MS,
+        Math.floor(uploadTokenMaxAgeMs / 2)
+      );
+      refreshForUploadToken =
+        Date.now() - uploadTokenIssuedAt >= uploadTokenMaxAgeMs - tokenRefreshBufferMs;
+    }
+
+    if (refreshForPartUrl || refreshForUploadToken) {
       await refreshPartUrl(part, partIndex, partState);
     }
   }
@@ -328,7 +444,10 @@
       await postJson(
         abortUrl,
         { upload_token: uploadToken },
-        { keepalive: Boolean(options.keepalive) }
+        {
+          keepalive: Boolean(options.keepalive),
+          skipCsrfRefresh: Boolean(options.keepalive),
+        }
       );
     } catch (error) {
       // A bucket lifecycle rule cleans up any incomplete multipart upload if
@@ -392,6 +511,9 @@
       });
 
       uploadToken = initiation.upload_token;
+      uploadTokenIssuedAt = Date.now();
+      uploadTokenMaxAgeMs =
+        (Number(initiation.upload_token_expires_in) || 0) * 1000;
       setProgress(
         0,
         `Uploading ${initiation.total_parts} part${initiation.total_parts === 1 ? "" : "s"} directly to S3…`

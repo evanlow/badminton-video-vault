@@ -27,6 +27,8 @@
           data-complete-url="{{ url_for('multipart_upload_complete') }}"
           data-abort-url="{{ url_for('multipart_upload_abort') }}"
           data-refresh-part-url="{{ url_for('multipart_upload_refresh_part') }}"
+          data-csrf-token-url="{{ url_for('api_csrf_token') }}"
+          data-csrf-token-lifetime-seconds="{{ csrf_token_lifetime_seconds }}"
           data-max-file-size="{{ max_video_file_size }}"
           data-upload-concurrency="{{ multipart_upload_concurrency }}"
         >

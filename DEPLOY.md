@@ -74,7 +74,7 @@ Default upload settings:
 - Concurrent part uploads: 3
 - Automatic attempts per failed part: 3
 - Presigned part URL lifetime: 2 hours
-- Signed upload-token lifetime: 6 hours
+- Signed upload-token lifetime per token: 6 hours (renewed while the authenticated upload page remains open)
 
 The S3 bucket remains private. Upload, playback, and download use temporary presigned URLs.
 
