@@ -41,7 +41,7 @@ You need:
 | Matroska | `.mkv` |
 | WebM | `.webm` |
 
-The default maximum file size is **2 GiB**. An administrator can configure a different limit.
+The default maximum file size is **3 GiB**. An administrator can configure a different limit.
 
 ---
 
@@ -105,7 +105,7 @@ This design avoids copying a multi-gigabyte video through the application server
 
 - Prefer a stable wired or strong Wi-Fi connection.
 - Disable sleep mode during a long upload.
-- A 2 GiB upload can take many minutes on a slow upstream connection.
+- A 3 GiB upload can take many minutes on a slow upstream connection.
 - The final percentage may pause briefly while S3 combines the parts and the application saves metadata.
 
 ---
@@ -200,7 +200,7 @@ Deactivation prevents login but preserves existing video metadata and S3 objects
 
 ### What formats and sizes are accepted?
 
-MP4, AVI, MOV, MKV, and WebM. The default maximum is 2 GiB.
+MP4, AVI, MOV, MKV, and WebM. The default maximum is 3 GiB.
 
 ### Can I upload several videos at once?
 

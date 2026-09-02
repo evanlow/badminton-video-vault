@@ -90,7 +90,7 @@ The app will be available at `http://localhost:5000`.
 | `AWS_REGION` | S3 bucket region |
 | `S3_BUCKET_NAME` | Private S3 bucket name |
 | `PRESIGNED_URL_EXPIRY` | Playback/download URL lifetime in seconds |
-| `MAX_VIDEO_FILE_SIZE` | Largest selectable video in bytes; default 2 GiB |
+| `MAX_VIDEO_FILE_SIZE` | Largest selectable video in bytes; default 3 GiB |
 | `MAX_REQUEST_BODY_SIZE` | Maximum Flask request body; default 4 MiB |
 | `S3_MULTIPART_PART_SIZE` | S3 part size; default 16 MiB |
 | `S3_MULTIPART_URL_EXPIRY` | Multipart part URL lifetime; default 7,200 seconds |

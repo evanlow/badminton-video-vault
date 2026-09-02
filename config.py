@@ -56,7 +56,7 @@ class Config:
     # coordination requests; the video bytes never pass through EC2.
     MAX_VIDEO_FILE_SIZE = _env_int(
         "MAX_VIDEO_FILE_SIZE",
-        2 * 1024 * 1024 * 1024,
+        3 * 1024 * 1024 * 1024,
         minimum=1,
         maximum=5 * 1024 * 1024 * 1024,
     )

@@ -43,7 +43,7 @@ app.config.update(
         "WTF_CSRF_ENABLED": False,
         "SECRET_KEY": "test-secret-key",
         "APP_BASE_URL": "http://localhost",
-        "MAX_VIDEO_FILE_SIZE": 2 * 1024 * 1024 * 1024,
+        "MAX_VIDEO_FILE_SIZE": 3 * 1024 * 1024 * 1024,
         "S3_MULTIPART_PART_SIZE": 16 * 1024 * 1024,
         "S3_MULTIPART_URL_EXPIRY": 7200,
         "S3_MULTIPART_TOKEN_MAX_AGE": 21600,

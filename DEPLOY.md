@@ -69,7 +69,7 @@ Browser
 
 Default upload settings:
 
-- Maximum video size: 2 GiB
+- Maximum video size: 3 GiB
 - Part size: 16 MiB
 - Concurrent part uploads: 3
 - Automatic attempts per failed part: 3
@@ -518,7 +518,7 @@ AWS_REGION=YOUR_BUCKET_REGION
 S3_BUCKET_NAME=YOUR_EXACT_BUCKET_NAME
 PRESIGNED_URL_EXPIRY=3600
 
-MAX_VIDEO_FILE_SIZE=2147483648
+MAX_VIDEO_FILE_SIZE=3221225472
 MAX_REQUEST_BODY_SIZE=4194304
 S3_MULTIPART_PART_SIZE=16777216
 S3_MULTIPART_URL_EXPIRY=7200

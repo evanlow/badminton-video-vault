@@ -207,7 +207,7 @@ class TestMultipartUpload(BaseTestCase):
             response = self.client.post(
                 "/api/uploads/multipart/initiate",
                 json=self._initiate_payload(
-                    file_size=2 * 1024 * 1024 * 1024 + 1
+                    file_size=3 * 1024 * 1024 * 1024 + 1
                 ),
             )
         self.assertEqual(response.status_code, 400)
